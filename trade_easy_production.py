@@ -3547,10 +3547,15 @@ def render_permanent_dashboard_shell():
     st.markdown('<div class="section-head">📦 Dashboard — All Panels</div>', unsafe_allow_html=True)
     st.caption("सभी panels हमेशा दिखाई देंगे। Live-only values केवल market/live data उपलब्ध होने पर भरेंगी; कोई dummy market value नहीं दिखाई जाएगी।")
 
-    # NOTE: Option Chain and Trade Finder V2 have their own dedicated, stable
-    # render roots in dashboard(). They are intentionally NOT rendered here;
-    # rendering them in this fallback shell would create duplicate panels.
-    # Option Chain remains the only live-data-first section as requested.
+    # Option Chain permanent shell
+    st.markdown('<div class="section-head">📊 Option Chain</div>', unsafe_allow_html=True)
+    oc = st.columns(6)
+    for col, label in zip(oc, ["ATM / Spot", "PCR", "Max Pain", "CALL OI", "PUT OI", "OI Change"]):
+        col.metric(label, "—")
+    st.caption("WAITING FOR LIVE OPTION-CHAIN DATA • यह box market बंद होने पर भी दिखाई देगा।")
+
+    # V2 permanent shell
+    render_trade_finder_v2({}, {15:{},30:{},60:{}}, {})
 
     # Strategy / decision boxes
     shell_sections = [
@@ -3588,43 +3593,6 @@ def dashboard(user, workspace):
     paper_user_id = getattr(user, "id", "")
     paper_workspace_id = workspace.get("id") if workspace else "default"
     paper_state = load_paper_state(paper_user_id, paper_workspace_id)
-
-    # ============================================================
-    # PERMANENT PAPER TRADING CONTROL
-    # This control is intentionally outside all live-data fragments and
-    # strategy render roots. It must remain visible at all times, including
-    # market-closed / WAITING / no-FYERS-data states.
-    # ============================================================
-    st.markdown('<div class="section-head">🧹 Paper Trading Controls</div>', unsafe_allow_html=True)
-    reset_col, reset_info = st.columns([1.15, 3.85])
-    with reset_col:
-        if st.button(
-            "🧹 RESET PAPER TRADING",
-            use_container_width=True,
-            type="secondary",
-            key="reset_paper_trading_permanent",
-            help="Reset only paper-trading state: today's trades, P&L, open paper position and audit history. FYERS/live data and strategy settings are unchanged.",
-        ):
-            paper_state["date"] = pd.Timestamp.now(tz="Asia/Kolkata").strftime("%Y-%m-%d")
-            paper_state["daily_realized_pnl"] = 0.0
-            paper_state["trades_today"] = 0
-            paper_state["open_position"] = None
-            paper_state["last_entry_signature"] = None
-            paper_state["trade_history"] = []
-            paper_state["audit_log"] = []
-            paper_state["paper_kill_switch"] = False
-            save_paper_state(paper_user_id, paper_workspace_id, paper_state)
-            st.session_state["paper_reset_notice"] = True
-            st.rerun()
-    with reset_info:
-        st.caption(
-            "Reset केवल Paper Trading को साफ करता है — Live/FYERS data, strategy settings और fixed Qty 65 सुरक्षित रहते हैं। "
-            f"Current: {"OPEN" if paper_state.get("open_position") else "FLAT"} • "
-            f"Trades: {int(paper_state.get("trades_today", 0))} • "
-            f"P&L: ₹{float(paper_state.get("daily_realized_pnl", 0.0)):,.2f}"
-        )
-    if st.session_state.pop("paper_reset_notice", False):
-        st.success("✅ Paper Trading reset हो गया — P&L ₹0, trades 0, open position साफ।")
     # Normalize any legacy/open paper position to the permanent paper quantity.
     if paper_state.get("open_position"):
         paper_state["open_position"]["quantity"] = PAPER_FIXED_QUANTITY
@@ -4977,6 +4945,33 @@ def dashboard(user, workspace):
             pe2.metric("Trades Today", f"{trades_today}/{int(max_trades)}")
             pe3.metric("Realized P&L", f"₹{daily_pnl:,.2f}")
             pe4.metric("Unrealized P&L", f"₹{paper_unrealized:,.2f}")
+
+            # Prominent PAPER-only reset control. Kept in the main dashboard so it is
+            # always visible; it never disconnects FYERS or sends a broker order.
+            reset_col, info_col = st.columns([1, 3])
+            with reset_col:
+                if st.button(
+                    "🧹 RESET PAPER TRADING DAY",
+                    use_container_width=True,
+                    type="secondary",
+                    key="reset_paper_day_main",
+                    help="Clears paper trades, today's realized P&L, trade counters, audit history and any open paper position. Live data and strategy settings are unchanged.",
+                ):
+                    paper_state["date"] = pd.Timestamp.now(tz="Asia/Kolkata").strftime("%Y-%m-%d")
+                    paper_state["daily_realized_pnl"] = 0.0
+                    paper_state["trades_today"] = 0
+                    paper_state["open_position"] = None
+                    paper_state["last_entry_signature"] = None
+                    paper_state["trade_history"] = []
+                    paper_state["audit_log"] = []
+                    paper_state["paper_kill_switch"] = False
+                    save_paper_state(paper_user_id, paper_workspace_id, paper_state)
+                    st.session_state["paper_reset_notice"] = True
+                    st.rerun()
+            with info_col:
+                st.caption("Reset केवल Paper Trading history/P&L को साफ करता है। Live data, strategy settings और fixed Qty 65 सुरक्षित रहते हैं।")
+            if st.session_state.pop("paper_reset_notice", False):
+                st.success("✅ Paper Trading reset हो गया — P&L ₹0, trades 0, open position साफ।")
 
             if paper_state.get("open_position"):
                 pp = paper_state["open_position"]
