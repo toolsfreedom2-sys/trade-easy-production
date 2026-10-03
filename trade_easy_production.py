@@ -1,5 +1,4 @@
 import hashlib
-import hmac
 import os
 import base64
 import math
@@ -8,7 +7,6 @@ import uuid
 import time
 import webbrowser
 import threading
-import unicodedata
 from pathlib import Path
 from hashlib import sha256
 from collections import deque
@@ -18,7 +16,6 @@ import pandas as pd
 import numpy as np
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
 from supabase import create_client, Client
 
 try:
@@ -38,8 +35,8 @@ except Exception:
     FYERS_SDK_OK = False
 
 # ============================================================
-# TRADE EASY - INDEX TRADING CONFIRMATION SOFTWARE - V11 PRODUCTION
-# 5/8 EMA + stable no-blink + production deployment revision
+# TRADE EASY - INDEX TRADING CONFIRMATION SOFTWARE - V2 TRADE FINDER
+# 5/8 EMA + stable no-blink + production deployment + Trade Finder V2
 # Built from the supplied PDF functional specification.
 #
 # IMPORTANT:
@@ -70,11 +67,6 @@ def _config_value(name: str, default: str = "") -> str:
 
 SUPABASE_URL = _config_value("SUPABASE_URL")
 SUPABASE_PUBLISHABLE_KEY = _config_value("SUPABASE_PUBLISHABLE_KEY")
-# Server-only Supabase secret key. Never expose this in the UI or GitHub.
-SUPABASE_SECRET_KEY = _config_value("SUPABASE_SECRET_KEY")
-# One-time admin bootstrap gate. Keep both values in Streamlit Secrets only.
-TRADE_EASY_ADMIN_EMAIL = _config_value("TRADE_EASY_ADMIN_EMAIL", "markam296@gmail.com")
-TRADE_EASY_ADMIN_BOOTSTRAP_TOKEN = _config_value("TRADE_EASY_ADMIN_BOOTSTRAP_TOKEN")
 
 TRADE_EASY_PUBLIC_URL = _config_value("TRADE_EASY_PUBLIC_URL")
 
@@ -1330,153 +1322,6 @@ def admin_load_all():
     return profiles, plans, subscriptions, payments
 
 
-@st.cache_resource
-def get_supabase_admin() -> Client:
-    """Create a stateless, server-only Supabase Admin client.
-
-    Auth Admin methods must run on a trusted server with the project's
-    secret key. Disabling session persistence/auto-refresh prevents the
-    normal user-auth client from replacing the Admin Authorization header.
-    """
-    if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
-        raise RuntimeError("Supabase Admin configuration is missing.")
-    # Keep this Admin client completely separate from the normal user client.
-    # We intentionally do not pass ClientOptions here because deployed
-    # supabase-py installations can have incompatible ClientOptions models
-    # (which can raise: 'ClientOptions' object has no attribute 'storage').
-    # A dedicated client instance already prevents the normal user's session
-    # from being mixed into the Admin client.
-    return create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
-
-
-def admin_reset_user_password(user_id, new_password):
-    """Reset any user's Supabase Auth password from the trusted server."""
-    if not SUPABASE_SECRET_KEY:
-        return False, "SUPABASE_SECRET_KEY Streamlit Secrets में configured नहीं है।"
-    if not user_id:
-        return False, "User ID missing है।"
-    if not new_password or len(new_password) < 8:
-        return False, "Password कम-से-कम 8 characters का होना चाहिए।"
-
-    try:
-        admin_client = get_supabase_admin()
-        response = admin_client.auth.admin.update_user_by_id(
-            str(user_id),
-            {"password": str(new_password)},
-        )
-        updated_user = getattr(response, "user", None)
-        if updated_user is not None:
-            return True, None
-
-        # Some supabase-py versions expose the response as a dict-like object.
-        if isinstance(response, dict) and response.get("user"):
-            return True, None
-
-        return False, "Supabase Auth ने password update का user response नहीं लौटाया।"
-    except Exception as exc:
-        detail = str(exc)
-        return False, f"Supabase Auth Admin password update failed: {detail}"
-
-
-def admin_bootstrap_admin_password(email, bootstrap_token, new_password):
-    """Pre-login first-admin password bootstrap using Supabase Auth Admin SDK.
-
-    The configured public.profiles row is the authoritative application-side
-    link to auth.users because profiles.id == auth.users.id in this project.
-    We therefore resolve the admin user ID from profiles first instead of
-    relying on list_users() pagination/email matching.
-    """
-    email = str(email or "").strip().lower()
-    bootstrap_token = str(bootstrap_token or "")
-    new_password = str(new_password or "")
-
-    if not SUPABASE_SECRET_KEY:
-        return False, "SUPABASE_SECRET_KEY Streamlit Secrets में configured नहीं है।"
-    if not TRADE_EASY_ADMIN_BOOTSTRAP_TOKEN:
-        return False, "TRADE_EASY_ADMIN_BOOTSTRAP_TOKEN Streamlit Secrets में configured नहीं है।"
-    if not email or not hmac.compare_digest(
-        email, TRADE_EASY_ADMIN_EMAIL.strip().lower()
-    ):
-        return False, "यह email configured first-admin email नहीं है।"
-    if not hmac.compare_digest(
-        bootstrap_token, TRADE_EASY_ADMIN_BOOTSTRAP_TOKEN
-    ):
-        return False, "Admin bootstrap token गलत है।"
-    if len(new_password) < 8:
-        return False, "Password कम-से-कम 8 characters का होना चाहिए।"
-
-    try:
-        admin_client = get_supabase_admin()
-
-        # The project's profile row is already known to exist for this admin,
-        # and profiles.id is the same UUID as auth.users.id. Resolve that UUID
-        # directly through the trusted server-side client.
-        profile_result = (
-            admin_client.table("profiles")
-            .select("id,email,role,status")
-            .eq("email", email)
-            .limit(1)
-            .execute()
-        )
-        profiles = profile_result.data or []
-
-        if not profiles:
-            return False, (
-                f"Supabase public.profiles में {email} नहीं मिला। "
-                "यह Streamlit app जिस Supabase project से जुड़ा है, उसमें "
-                "admin profile मौजूद है या नहीं जाँचें।"
-            )
-
-        profile = profiles[0]
-        user_id = str(profile.get("id") or "").strip()
-        if not user_id:
-            return False, "Admin profile में user ID नहीं मिली।"
-
-        if str(profile.get("role", "")).lower() != "admin" or str(
-            profile.get("status", "")
-        ).lower() != "active":
-            return False, (
-                "Admin profile का role='admin' और status='active' होना चाहिए।"
-            )
-
-        # Confirm that this UUID actually exists in Supabase Auth, then update
-        # the password using the official Auth Admin API.
-        try:
-            auth_lookup = admin_client.auth.admin.get_user_by_id(user_id)
-            auth_user = getattr(auth_lookup, "user", None)
-            if auth_user is None and isinstance(auth_lookup, dict):
-                auth_user = auth_lookup.get("user")
-        except Exception as lookup_exc:
-            return False, (
-                "Supabase profile मिल गया, लेकिन Auth user lookup failed: "
-                f"{lookup_exc}"
-            )
-
-        if auth_user is None:
-            return False, (
-                f"Supabase Auth में user ID {user_id} नहीं मिला। "
-                "यह profile और auth.users के बीच mismatch है।"
-            )
-
-        response = admin_client.auth.admin.update_user_by_id(
-            user_id,
-            {
-                "password": new_password,
-                "email_confirm": True,
-            },
-        )
-        updated_user = getattr(response, "user", None)
-        if updated_user is None and not (
-            isinstance(response, dict) and response.get("user")
-        ):
-            return False, "Supabase Auth ने password update confirm नहीं किया।"
-
-        return True, None
-
-    except Exception as exc:
-        return False, f"Admin bootstrap error: {exc}"
-
-
 def admin_update_profile(user_id, *, role=None, status=None):
     payload = {}
     if role is not None:
@@ -1827,26 +1672,6 @@ def admin_dashboard(user, profile, workspace):
                         st.success("User access updated.") if ok else st.error(err or "Update failed")
                         if ok:
                             st.rerun()
-
-                    st.markdown("#### 🔐 Admin Password Management")
-                    st.caption("Admin यहाँ से किसी selected user का Supabase login password सीधे बदल सकता है। Password केवल server-side Auth Admin API को भेजा जाता है।")
-                    with st.form(f"admin_password_form_{uid}", clear_on_submit=True):
-                        pw1 = st.text_input("New Password", type="password", key=f"admin_pw1_{uid}")
-                        pw2 = st.text_input("Confirm New Password", type="password", key=f"admin_pw2_{uid}")
-                        change_pw = st.form_submit_button("Change Password", use_container_width=True, type="primary")
-                    if change_pw:
-                        if not SUPABASE_SECRET_KEY:
-                            st.error("SUPABASE_SECRET_KEY configured नहीं है। पहले Streamlit Secrets में इसे जोड़ें।")
-                        elif len(pw1) < 8:
-                            st.error("Password कम-से-कम 8 characters का होना चाहिए।")
-                        elif pw1 != pw2:
-                            st.error("दोनों passwords match नहीं कर रहे हैं।")
-                        else:
-                            ok, err = admin_reset_user_password(uid, pw1)
-                            if ok:
-                                st.success(f"✅ Password changed successfully for {current.get('email', 'selected user')}.")
-                            else:
-                                st.error(err or "Password update failed.")
         else:
             st.info("अभी कोई profile नहीं मिली। पहले subscription setup SQL चलाएँ।")
 
@@ -2065,196 +1890,104 @@ with check (public.trade_easy_is_admin());
 
 
 def login_page():
-    """Compact centered popup-style authentication screen."""
     st.markdown("""
     <style>
-    /* Compact popup: logo and form live in the same visual card. */
     .stApp {
         background:
-            radial-gradient(circle at 15% 18%, rgba(38,99,235,.20), transparent 30%),
-            radial-gradient(circle at 85% 18%, rgba(139,92,246,.16), transparent 28%),
-            linear-gradient(135deg,#050b16 0%,#0a1222 48%,#060b14 100%);
+            radial-gradient(circle at 10% 10%, rgba(54,105,255,.25), transparent 28%),
+            radial-gradient(circle at 90% 10%, rgba(175,80,255,.20), transparent 30%),
+            linear-gradient(135deg,#071426,#101b35,#080d1b);
     }
-    [data-testid="stHeader"] { background: transparent; }
-    [data-testid="stToolbar"] { display:none; }
-
-    /* The authentication row itself becomes the popup. */
-    .stApp .stHorizontalBlock {
-        max-width: 520px !important;
-        margin: 7vh auto 0 auto !important;
-        align-items: stretch !important;
+    .auth-card {
+        max-width: 560px;
+        margin: 70px auto 20px auto;
+        padding: 34px;
+        border-radius: 24px;
+        background: rgba(255,255,255,.07);
+        border: 1px solid rgba(255,255,255,.12);
+        box-shadow: 0 20px 60px rgba(0,0,0,.30);
     }
-    .stApp .stHorizontalBlock > div[data-testid="column"] {
-        display: none;
-    }
-    .stApp .stHorizontalBlock > div[data-testid="column"]:nth-child(2) {
-        display: block !important;
-        flex: 0 0 100% !important;
-        width: 100% !important;
-        max-width: 100% !important;
-        padding: 24px 34px 24px !important;
-        border-radius: 22px !important;
-        background: rgba(12,20,35,.92) !important;
-        border: 1px solid rgba(148,163,184,.20) !important;
-        box-shadow: 0 24px 80px rgba(0,0,0,.48), inset 0 1px 0 rgba(255,255,255,.05) !important;
-        backdrop-filter: blur(18px);
-        box-sizing: border-box !important;
-    }
-
-    .te-auth-brand { text-align:center; margin:0 0 12px 0; }
-    .te-auth-logo {
-        width:52px;height:52px;margin:0 auto 7px;border-radius:15px;
-        display:flex;align-items:center;justify-content:center;
-        font-size:25px;font-weight:900;
-        background:linear-gradient(135deg,#2563eb,#7c3aed);
-        color:#fff;box-shadow:0 9px 25px rgba(37,99,235,.25);
-    }
-    .te-auth-title { color:#f8fafc;font-size:24px;font-weight:850;line-height:1.05;letter-spacing:-.4px; }
-    .te-auth-sub { color:#94a3b8;font-size:11px;margin-top:4px; }
-
-    div[data-testid="stTabs"] { margin-top: 2px !important; }
-    div[data-testid="stTabs"] button { font-size:13px !important; font-weight:700 !important; }
-    div[data-testid="stTabsContent"] { padding-top: 10px !important; }
-
-    /* White input boxes with dark text for clear typing. */
-    div[data-testid="stTextInput"] { margin-bottom: 7px !important; }
-    div[data-testid="stTextInput"] label {
-        color:#cbd5e1 !important;
-        font-size:12px !important;
-        font-weight:600 !important;
-        margin-bottom:3px !important;
-    }
-    div[data-testid="stTextInput"] input,
-    div[data-testid="stTextInput"] input:focus {
-        background:#ffffff !important;
-        color:#111827 !important;
-        -webkit-text-fill-color:#111827 !important;
-        caret-color:#111827 !important;
-        border:1px solid #cbd5e1 !important;
-        border-radius:10px !important;
-        box-shadow:none !important;
-        min-height:40px !important;
-    }
-    div[data-testid="stTextInput"] input::placeholder {
-        color:#6b7280 !important;
-        opacity:1 !important;
-    }
-    div[data-testid="stTextInput"] input:focus {
-        border-color:#64748b !important;
-        box-shadow:0 0 0 2px rgba(59,130,246,.14) !important;
-    }
-
-    div.stButton { margin-top:7px !important; }
-    div.stButton > button {
-        border-radius:10px !important;
-        min-height:40px !important;
-        font-weight:700 !important;
-    }
-    .te-auth-caption {
-        color:#64748b;font-size:10px;text-align:center;margin-top:10px;
-    }
-
-    @media (max-width: 640px) {
-        .stApp .stHorizontalBlock {
-            max-width: calc(100% - 24px) !important;
-            margin-top: 4vh !important;
-        }
-        .stApp .stHorizontalBlock > div[data-testid="column"]:nth-child(2) {
-            padding:20px 18px 18px !important;
-        }
-    }
+    .auth-title { color:#fff; font-size:36px; font-weight:900; }
+    .auth-sub { color:#aebbd2; margin-bottom:25px; }
     </style>
     """, unsafe_allow_html=True)
 
-    left, center, right = st.columns([1.15, 1.7, 1.15])
-    with center:
-        st.markdown("""
-        <div class="te-auth-brand">
-          <div class="te-auth-logo">TE</div>
-          <div class="te-auth-title">Trade Easy</div>
-          <div class="te-auth-sub">Index Trading Confirmation &amp; Risk Control</div>
-        </div>
-        """, unsafe_allow_html=True)
+    st.markdown(
+        '<div class="auth-card">'
+        '<div class="auth-title">Trade Easy Trading</div>'
+        '<div class="auth-sub">Index Trading Confirmation & Risk Control</div>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
 
-        login_tab, signup_tab = st.tabs(["🔐 Login", "🆕 Create Account"])
+    login_tab, signup_tab = st.tabs(["🔐 Login", "🆕 Create Account"])
 
-        with login_tab:
-            email = st.text_input("Email", key="login_email", placeholder="you@example.com")
-            password = st.text_input("Password", type="password", key="login_password", placeholder="Enter your password")
+    with login_tab:
+        email = st.text_input("Email", key="login_email")
+        password = st.text_input("Password", type="password", key="login_password")
 
-            if st.button("Login", use_container_width=True, type="primary", key="login_btn"):
-                try:
-                    result = supabase.auth.sign_in_with_password(
-                        {"email": email.strip(), "password": password}
+        if st.button("Login", use_container_width=True, type="primary"):
+            try:
+                result = supabase.auth.sign_in_with_password(
+                    {"email": email.strip(), "password": password}
+                )
+                if getattr(result, "user", None):
+                    st.success("Login successful")
+                    st.rerun()
+                else:
+                    st.error("Login failed.")
+            except Exception as e:
+                st.error(f"Login error: {e}")
+
+        st.divider()
+
+        if st.button("Continue with Google", use_container_width=True):
+            try:
+                response = supabase.auth.sign_in_with_oauth(
+                    {
+                        "provider": "google",
+                        "options": {"redirect_to": REDIRECT_URL},
+                    }
+                )
+                url = getattr(response, "url", None)
+                if url:
+                    st.markdown(
+                        f'<meta http-equiv="refresh" content="0; url={url}">',
+                        unsafe_allow_html=True,
                     )
-                    if getattr(result, "user", None):
-                        st.success("Login successful")
-                        st.rerun()
-                    else:
-                        st.error("Login failed.")
-                except Exception as e:
-                    st.error(f"Login error: {e}")
+                    st.info("Google Login खोल रहा है...")
+                else:
+                    st.error("Google OAuth URL नहीं मिला।")
+            except Exception as e:
+                st.error(f"Google login error: {e}")
 
-            forgot_left, forgot_col, forgot_right = st.columns([1, 1.35, 1])
-            with forgot_col:
-                if st.button("Forgot Password?", use_container_width=True, key="forgot_password_btn"):
-                    if not email.strip():
-                        st.warning("पहले अपना email address डालें।")
-                    else:
-                        try:
-                            password_reset_url = f"{TRADE_EASY_PUBLIC_URL.rstrip('/')}/?reset_password=1"
-                            supabase.auth.reset_password_for_email(
-                                email.strip(),
-                                {"redirect_to": password_reset_url},
-                            )
-                            st.success("Password reset link भेज दिया गया है। Email खोलें और नया password सेट करें।")
-                        except Exception as e:
-                            st.error(f"Password reset error: {e}")
+    with signup_tab:
+        name = st.text_input("Name", key="signup_name")
+        email = st.text_input("Email", key="signup_email")
+        password = st.text_input("Password", type="password", key="signup_password")
 
-            if st.button("Continue with Google", use_container_width=True, key="google_login_btn"):
-                try:
-                    response = supabase.auth.sign_in_with_oauth(
-                        {"provider": "google", "options": {"redirect_to": REDIRECT_URL}}
+        if st.button("Create Account", use_container_width=True, type="primary"):
+            try:
+                result = supabase.auth.sign_up(
+                    {
+                        "email": email.strip(),
+                        "password": password,
+                        "options": {
+                            "data": {
+                                "display_name": name.strip(),
+                                "full_name": name.strip(),
+                            }
+                        },
+                    }
+                )
+                if getattr(result, "user", None):
+                    st.success(
+                        "Account created. अगर email confirmation enabled है तो पहले email confirm करें।"
                     )
-                    url = getattr(response, "url", None)
-                    if url:
-                        st.markdown(
-                            f'<meta http-equiv="refresh" content="0; url={url}">',
-                            unsafe_allow_html=True,
-                        )
-                        st.info("Google Login खोल रहा है...")
-                    else:
-                        st.error("Google OAuth URL नहीं मिला।")
-                except Exception as e:
-                    st.error(f"Google login error: {e}")
-
-        with signup_tab:
-            name = st.text_input("Name", key="signup_name", placeholder="Your name")
-            email = st.text_input("Email", key="signup_email", placeholder="you@example.com")
-            password = st.text_input("Password", type="password", key="signup_password", placeholder="Create a password")
-
-            if st.button("Create Account", use_container_width=True, type="primary", key="signup_btn"):
-                try:
-                    result = supabase.auth.sign_up(
-                        {
-                            "email": email.strip(),
-                            "password": password,
-                            "options": {
-                                "data": {
-                                    "display_name": name.strip(),
-                                    "full_name": name.strip(),
-                                }
-                            },
-                        }
-                    )
-                    if getattr(result, "user", None):
-                        st.success("Account created. अगर email confirmation enabled है तो पहले email confirm करें।")
-                    else:
-                        st.error("Account creation failed.")
-                except Exception as e:
-                    st.error(f"Signup error: {e}")
-
-        st.markdown('<div class="te-auth-caption">Secure authentication • Trade Easy</div>', unsafe_allow_html=True)
+                else:
+                    st.error("Account creation failed.")
+            except Exception as e:
+                st.error(f"Signup error: {e}")
 
 
 # ============================================================
@@ -3178,6 +2911,362 @@ def make_demo_data():
 # DASHBOARD
 # ============================================================
 
+# ============================================================
+# TRADE FINDER ENGINE V2
+# User-requested option-trade confirmation layer.
+# - 15/30/60 minute directional confirmation
+# - intraday OI/OI-change history snapshots (15/30/60m)
+# - exact 50-point underlying clear-path gate
+# - option candidate filter: |Delta| >= 0.70 and Theta in [-10, -5]
+# - PCR + OI trend + price structure scoring
+# - 15-minute expected-move map derived from current ATR (not a guarantee)
+# - paper/analysis only; no broker order API is called
+# ============================================================
+
+TF2_OI_HISTORY_KEY = "trade_easy_tf2_oi_history"
+TF2_MTF_CACHE_KEY = "trade_easy_tf2_mtf_cache"
+TF2_MTF_AT_KEY = "trade_easy_tf2_mtf_at"
+TF2_EXPECTED_MOVE_POINTS = 50.0
+TF2_MIN_DELTA = 0.70
+TF2_THETA_MIN = -10.0
+TF2_THETA_MAX = -5.0
+
+
+def _tf2_num(v):
+    try:
+        x = float(v)
+        return x if np.isfinite(x) else np.nan
+    except Exception:
+        return np.nan
+
+
+def _tf2_delta_abs(v):
+    x = abs(_tf2_num(v))
+    if not np.isfinite(x):
+        return np.nan
+    # Be tolerant if a provider ever supplies Delta as 70 instead of 0.70.
+    return x / 100.0 if x > 1.5 else x
+
+
+def _tf2_completed_candles(raw, resolution):
+    try:
+        df = normalize_candles(raw)
+        if df.empty:
+            return df
+        now_utc = pd.Timestamp.now(tz="UTC")
+        interval = pd.Timedelta(minutes=int(resolution))
+        while len(df) and df["timestamp"].iloc[-1] + interval > now_utc:
+            df = df.iloc[:-1].reset_index(drop=True)
+        return df
+    except Exception:
+        return pd.DataFrame()
+
+
+def _tf2_mtf_state(df, resolution):
+    if df is None or df.empty or len(df) < 25:
+        return {"resolution": int(resolution), "direction": None, "arrow": "—", "status": "WARMING"}
+    try:
+        x = add_indicators(df)
+        last = x.iloc[-1]
+        close = _tf2_num(last.get("close"))
+        e5 = _tf2_num(last.get("ema_5"))
+        e8 = _tf2_num(last.get("ema_8"))
+        rsi_v = _tf2_num(last.get("rsi"))
+        macd = _tf2_num(last.get("macd"))
+        macd_sig = _tf2_num(last.get("macd_signal"))
+        structure = market_structure(x)
+        bull = sum([
+            bool(np.isfinite(close) and np.isfinite(e5) and close > e5),
+            bool(np.isfinite(e5) and np.isfinite(e8) and e5 > e8),
+            bool(np.isfinite(rsi_v) and rsi_v >= 50),
+            bool(np.isfinite(macd) and np.isfinite(macd_sig) and macd > macd_sig),
+            structure == "BULLISH",
+        ])
+        bear = sum([
+            bool(np.isfinite(close) and np.isfinite(e5) and close < e5),
+            bool(np.isfinite(e5) and np.isfinite(e8) and e5 < e8),
+            bool(np.isfinite(rsi_v) and rsi_v < 50),
+            bool(np.isfinite(macd) and np.isfinite(macd_sig) and macd < macd_sig),
+            structure == "BEARISH",
+        ])
+        if bull >= 3 and bull > bear:
+            direction, arrow = "LONG", "↑"
+        elif bear >= 3 and bear > bull:
+            direction, arrow = "SHORT", "↓"
+        else:
+            direction, arrow = None, "→"
+        return {
+            "resolution": int(resolution), "direction": direction, "arrow": arrow,
+            "bull_score": int(bull), "bear_score": int(bear), "structure": structure,
+            "rsi": float(rsi_v) if np.isfinite(rsi_v) else None,
+            "close": float(close) if np.isfinite(close) else None,
+            "status": "READY",
+        }
+    except Exception as exc:
+        return {"resolution": int(resolution), "direction": None, "arrow": "—", "status": "ERROR", "error": str(exc)}
+
+
+def tf2_mtf_confirmation(access_token, app_id, symbol):
+    """Fetch/caches completed 15/30/60m candles and return directional states."""
+    cache = st.session_state.setdefault(TF2_MTF_CACHE_KEY, {})
+    at = st.session_state.setdefault(TF2_MTF_AT_KEY, {})
+    now = time.time()
+    out = {}
+    for resolution in (15, 30, 60):
+        key = f"{symbol}|{resolution}"
+        if key in cache and now - float(at.get(key, 0.0)) < 15.0:
+            out[resolution] = cache[key]
+            continue
+        try:
+            raw, _ = fyers_history_snapshot(
+                access_token, app_id, symbol, resolution=resolution, days=5, min_interval=15.0
+            )
+            state = _tf2_mtf_state(_tf2_completed_candles(raw, resolution), resolution)
+        except Exception as exc:
+            state = {"resolution": resolution, "direction": None, "arrow": "—", "status": "ERROR", "error": str(exc)}
+        cache[key] = state
+        at[key] = now
+        out[resolution] = state
+    return out
+
+
+def tf2_update_oi_history(option_summary, live_price, timestamp=None):
+    """Keep intraday option-chain totals so 15/30/60m OI deltas can be compared.
+
+    FYERS OI Change is session-to-previous-session change; this layer additionally
+    records our own intraday snapshots so the user can see 15/30/60m changes.
+    """
+    if not option_summary or not option_summary.get("available"):
+        return {"status": "NO_DATA"}
+    now = float(timestamp if timestamp is not None else time.time())
+    history = st.session_state.setdefault(TF2_OI_HISTORY_KEY, [])
+    row = {
+        "ts": now,
+        "call_oi": _tf2_num(option_summary.get("call_oi")),
+        "put_oi": _tf2_num(option_summary.get("put_oi")),
+        "call_oi_change": _tf2_num(option_summary.get("call_oi_change")),
+        "put_oi_change": _tf2_num(option_summary.get("put_oi_change")),
+        "pcr": _tf2_num(option_summary.get("pcr")),
+        "price": _tf2_num(live_price),
+    }
+    if history:
+        last = history[-1]
+        # Avoid storing the same snapshot repeatedly when the option-chain data
+        # has not changed materially.
+        if now - float(last.get("ts", 0.0)) < 20 and all(
+            (not np.isfinite(row[k]) and not np.isfinite(_tf2_num(last.get(k))))
+            or (np.isfinite(row[k]) and np.isfinite(_tf2_num(last.get(k))) and abs(row[k] - _tf2_num(last.get(k))) < 1e-9)
+            for k in ("call_oi", "put_oi", "call_oi_change", "put_oi_change")
+        ):
+            return tf2_oi_history_view(history, now)
+    history.append(row)
+    # Keep roughly one trading day of snapshots at most.
+    cutoff = now - 7 * 3600
+    st.session_state[TF2_OI_HISTORY_KEY] = [x for x in history if float(x.get("ts", 0.0)) >= cutoff][-1500:]
+    return tf2_oi_history_view(st.session_state[TF2_OI_HISTORY_KEY], now)
+
+
+def _tf2_nearest_snapshot(history, now, minutes):
+    target = now - minutes * 60.0
+    if not history:
+        return None
+    candidates = [x for x in history if float(x.get("ts", 0.0)) <= target]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda x: abs(float(x.get("ts", 0.0)) - target))
+
+
+def tf2_oi_history_view(history, now=None):
+    now = float(now if now is not None else time.time())
+    result = {"status": "WARMING", "frames": {}}
+    for minutes in (15, 30, 60):
+        ref = _tf2_nearest_snapshot(history, now, minutes)
+        current = history[-1] if history else None
+        if not ref or not current:
+            result["frames"][minutes] = {"status": "WARMING"}
+            continue
+        def delta(name):
+            a, b = _tf2_num(current.get(name)), _tf2_num(ref.get(name))
+            return float(a - b) if np.isfinite(a) and np.isfinite(b) else np.nan
+        result["frames"][minutes] = {
+            "status": "READY",
+            "call_oi_delta": delta("call_oi"),
+            "put_oi_delta": delta("put_oi"),
+            "call_oi_change_delta": delta("call_oi_change"),
+            "put_oi_change_delta": delta("put_oi_change"),
+            "pcr": _tf2_num(current.get("pcr")),
+            "price_delta": delta("price"),
+            "age_minutes": max(0.0, (now - float(ref.get("ts", now))) / 60.0),
+        }
+    if any(v.get("status") == "READY" for v in result["frames"].values()):
+        result["status"] = "PARTIAL" if any(v.get("status") != "READY" for v in result["frames"].values()) else "READY"
+    return result
+
+
+def tf2_oi_direction(option_summary, oi_view):
+    """Classify option positioning conservatively from intraday OI changes."""
+    if not option_summary or not option_summary.get("available"):
+        return "—", 0, ["OI_DATA_MISSING"]
+    bull = bear = 0
+    reasons = []
+    for minutes in (15, 30, 60):
+        f = (oi_view.get("frames", {}) or {}).get(minutes, {})
+        if f.get("status") != "READY":
+            continue
+        c = _tf2_num(f.get("call_oi_delta")); p = _tf2_num(f.get("put_oi_delta")); px = _tf2_num(f.get("price_delta"))
+        if np.isfinite(c) and np.isfinite(p):
+            if p > 0 and c < 0:
+                bull += 2; reasons.append(f"{minutes}m PUT_OI↑/CALL_OI↓")
+            elif c > 0 and p < 0:
+                bear += 2; reasons.append(f"{minutes}m CALL_OI↑/PUT_OI↓")
+            elif p > c and p > 0:
+                bull += 1
+            elif c > p and c > 0:
+                bear += 1
+        if np.isfinite(px):
+            if px > 0: bull += 1
+            elif px < 0: bear += 1
+    if bull >= bear + 2:
+        return "BULLISH", bull, reasons
+    if bear >= bull + 2:
+        return "BEARISH", bear, reasons
+    return "SIDEWAYS", max(bull, bear), reasons or ["OI_BALANCED"]
+
+
+def tf2_select_option(chain_df, direction, live_price):
+    """Select one liquid CE/PE candidate using the user's hard Greeks filters."""
+    result = {"status": "NO TRADE", "reason": "NO_OPTION_CANDIDATE", "candidate": None, "candidates": 0}
+    if chain_df is None or chain_df.empty or direction not in ("LONG", "SHORT") or live_price is None:
+        return result
+    side = "CE" if direction == "LONG" else "PE"
+    x = chain_df[chain_df["type"].eq(side)].copy()
+    if x.empty:
+        result["reason"] = f"NO_{side}_CHAIN"
+        return result
+    x["delta_abs"] = x["delta"].apply(_tf2_delta_abs) if "delta" in x.columns else np.nan
+    x["theta_num"] = x["theta"].apply(_tf2_num) if "theta" in x.columns else np.nan
+    x["oi_num"] = x["oi"].apply(_tf2_num) if "oi" in x.columns else np.nan
+    x["volume_num"] = x["volume"].apply(_tf2_num) if "volume" in x.columns else np.nan
+    x["ltp_num"] = x["ltp"].apply(_tf2_num) if "ltp" in x.columns else np.nan
+    valid = x[
+        x["delta_abs"].ge(TF2_MIN_DELTA)
+        & x["theta_num"].between(TF2_THETA_MIN, TF2_THETA_MAX, inclusive="both")
+        & x["ltp_num"].gt(0)
+    ].copy()
+    result["candidates"] = int(len(valid))
+    if valid.empty:
+        result["reason"] = "GREEKS_FILTER_FAILED"
+        return result
+    atm = round(float(live_price) / 50.0) * 50.0
+    valid["strike_distance"] = (pd.to_numeric(valid["strike"], errors="coerce") - atm).abs()
+    valid["delta_score"] = (valid["delta_abs"] - 0.75).abs()
+    valid["oi_rank"] = valid["oi_num"].fillna(0)
+    valid = valid.sort_values(["strike_distance", "delta_score", "oi_rank"], ascending=[True, True, False])
+    row = valid.iloc[0]
+    candidate = {
+        "type": side,
+        "symbol": row.get("symbol"),
+        "strike": float(row.get("strike")),
+        "ltp": float(row.get("ltp_num")),
+        "oi": float(row.get("oi_num")) if np.isfinite(row.get("oi_num")) else np.nan,
+        "volume": float(row.get("volume_num")) if np.isfinite(row.get("volume_num")) else np.nan,
+        "delta": float(row.get("delta_abs")),
+        "theta": float(row.get("theta_num")),
+        "iv": float(_tf2_num(row.get("iv"))) if np.isfinite(_tf2_num(row.get("iv"))) else None,
+    }
+    result.update({"status": "READY", "reason": "GREEKS_FILTER_PASS", "candidate": candidate})
+    return result
+
+
+def tf2_trade_finder(df, direction, bias, option_summary, option_chain_df, oi_view, mtf, live_price, levels, level_setup):
+    """Return a single transparent Trade Finder V2 decision object."""
+    reasons, blockers = [], []
+    mtf_dirs = {int(k): (v or {}).get("direction") for k, v in mtf.items()}
+    mtf_ready = [d for d in mtf_dirs.values() if d]
+    long_count = sum(d == "LONG" for d in mtf_ready)
+    short_count = sum(d == "SHORT" for d in mtf_ready)
+    if direction == "LONG" and long_count >= 2 and short_count == 0:
+        mtf_pass = True
+    elif direction == "SHORT" and short_count >= 2 and long_count == 0:
+        mtf_pass = True
+    else:
+        mtf_pass = False
+        blockers.append("15/30/60M_NOT_ALIGNED")
+
+    oi_bias, oi_score, oi_reasons = tf2_oi_direction(option_summary, oi_view)
+    if direction == "LONG" and oi_bias == "BULLISH":
+        oi_pass = True
+    elif direction == "SHORT" and oi_bias == "BEARISH":
+        oi_pass = True
+    else:
+        oi_pass = False
+        blockers.append("OI_TREND_NOT_CONFIRMED")
+
+    pcr = _tf2_num(option_summary.get("pcr")) if option_summary else np.nan
+    pcr_pass = bool(np.isfinite(pcr) and ((direction == "LONG" and pcr >= 1.0) or (direction == "SHORT" and pcr <= 1.0)))
+    if pcr_pass: reasons.append(f"PCR {pcr:.2f} aligned")
+    else: blockers.append("PCR_NOT_ALIGNED")
+
+    candidate = tf2_select_option(option_chain_df, direction, live_price)
+    if candidate.get("status") == "READY": reasons.append("Delta/Theta filter passed")
+    else: blockers.append(candidate.get("reason", "OPTION_FILTER_FAILED"))
+
+    clear_path = _tf2_num((level_setup or {}).get("path", {}).get("clear_path"))
+    swing_50_pass = bool(np.isfinite(clear_path) and clear_path >= TF2_EXPECTED_MOVE_POINTS)
+    if swing_50_pass: reasons.append(f"50-point clear path {clear_path:.1f}")
+    else: blockers.append("50_POINT_CLEAR_PATH_FAILED")
+
+    ema_pass = bool(df is not None and not df.empty and ((direction == "LONG" and df["ema_5"].iloc[-1] > df["ema_8"].iloc[-1]) or (direction == "SHORT" and df["ema_5"].iloc[-1] < df["ema_8"].iloc[-1])))
+    if not ema_pass: blockers.append("EMA_5_8_NOT_ALIGNED")
+    else: reasons.append("5/8 EMA aligned")
+
+    atr_value = _tf2_num(df["atr"].iloc[-1]) if df is not None and not df.empty else np.nan
+    expected_move = max(TF2_EXPECTED_MOVE_POINTS, atr_value * 1.0 if np.isfinite(atr_value) else TF2_EXPECTED_MOVE_POINTS)
+    entry_price = _tf2_num(live_price)
+    expected_target = entry_price + expected_move if direction == "LONG" and np.isfinite(entry_price) else (entry_price - expected_move if direction == "SHORT" and np.isfinite(entry_price) else np.nan)
+    expected_exit = expected_target
+
+    # Transparent 100-point score. Hard gates below are still required for a trade.
+    score = 0
+    score += 20 if mtf_pass else 0
+    score += 20 if oi_pass else 0
+    score += 10 if pcr_pass else 0
+    score += 20 if candidate.get("status") == "READY" else 0
+    score += 15 if swing_50_pass else 0
+    score += 10 if ema_pass else 0
+    score += 5 if (bias == ("BULLISH" if direction == "LONG" else "BEARISH")) else 0
+
+    hard_pass = all([direction in ("LONG", "SHORT"), mtf_pass, oi_pass, pcr_pass,
+                     candidate.get("status") == "READY", swing_50_pass, ema_pass])
+    status = "TRADE FOUND" if hard_pass else "NO TRADE"
+    if hard_pass:
+        reasons.append("ALL V2 HARD FILTERS PASS")
+    else:
+        reasons = reasons[:]
+    return {
+        "status": status,
+        "score": int(score),
+        "direction": direction,
+        "oi_bias": oi_bias,
+        "oi_score": int(oi_score),
+        "oi_reasons": oi_reasons,
+        "pcr": float(pcr) if np.isfinite(pcr) else None,
+        "mtf": mtf,
+        "mtf_pass": mtf_pass,
+        "oi_pass": oi_pass,
+        "pcr_pass": pcr_pass,
+        "option": candidate,
+        "swing_50_pass": swing_50_pass,
+        "clear_path": float(clear_path) if np.isfinite(clear_path) else None,
+        "expected_move_15m": float(expected_move) if np.isfinite(expected_move) else None,
+        "expected_target": float(expected_target) if np.isfinite(expected_target) else None,
+        "expected_exit": float(expected_exit) if np.isfinite(expected_exit) else None,
+        "reasons": reasons,
+        "blockers": blockers,
+        "hard_pass": hard_pass,
+    }
+
+
 def dashboard(user, workspace):
     paper_user_id = getattr(user, "id", "")
     paper_workspace_id = workspace.get("id") if workspace else "default"
@@ -3329,58 +3418,6 @@ def dashboard(user, workspace):
     @media (max-width: 900px) { .live-ticker-grid { grid-template-columns: repeat(3, minmax(0,1fr)); } }
     /* Keep the browser viewport stable while the fragment updates. */
     html, body { scroll-behavior: auto !important; }
-
-    /* TOP HEADER + LOGOUT VISIBILITY FIX
-       Keep Streamlit's top header from appearing as a white strip over the
-       dashboard controls, and make dashboard action buttons readable. */
-    /* Remove Streamlit Cloud's built-in Share / Star / Edit / More toolbar. */
-    [data-testid="stToolbar"],
-    [data-testid="stHeaderActionElements"],
-    [data-testid="stDecoration"],
-    [data-testid="stStatusWidget"] {
-        display: none !important;
-        visibility: hidden !important;
-        pointer-events: none !important;
-    }
-    [data-testid="stHeader"] {
-        height: 0 !important;
-        min-height: 0 !important;
-        background: transparent !important;
-        border: 0 !important;
-        box-shadow: none !important;
-        z-index: 0 !important;
-    }
-    [data-testid="stHeader"] > div {
-        display: none !important;
-    }
-    /* Fallback selectors for Streamlit Cloud header action controls. */
-    header button, header a, header [role="button"] {
-        display: none !important;
-    }
-
-    /* Dashboard buttons: dark background + white text, including Logout. */
-    div[data-testid="stButton"] > button {
-        background: #172033 !important;
-        color: #ffffff !important;
-        border: 1px solid rgba(148,163,184,.30) !important;
-        box-shadow: 0 4px 12px rgba(0,0,0,.18) !important;
-    }
-    div[data-testid="stButton"] > button:hover {
-        background: #22304a !important;
-        color: #ffffff !important;
-        border-color: rgba(96,165,250,.55) !important;
-    }
-    div[data-testid="stButton"] > button:focus,
-    div[data-testid="stButton"] > button:focus-visible {
-        color: #ffffff !important;
-        outline: 2px solid rgba(96,165,250,.45) !important;
-        outline-offset: 1px !important;
-    }
-    /* Give the dashboard's top row enough clearance below Streamlit header. */
-    [data-testid="stAppViewContainer"] .main .block-container {
-        padding-top: 3.5rem !important;
-    }
-
     @media (max-width: 900px) {
         .state-title { font-size: 30px; }
         h1 { font-size: 1.65rem !important; }
@@ -3768,6 +3805,27 @@ def dashboard(user, workspace):
             s3.metric("5/8 EMA", "PASS" if ema_state.get("confirmed") else ("WAIT" if snapshot else "WAITING"))
             s4.metric("Entry Alert", "YES" if snap.get("entry_alert") else ("NO" if snapshot else "—"))
 
+            tf2 = snap.get("trade_finder_v2", {}) or {}
+            mtf15 = snap.get("mtf_15m", {}) or {}
+            mtf30 = snap.get("mtf_30m", {}) or {}
+            mtf60 = snap.get("mtf_60m", {}) or {}
+            tf2_status = tf2.get("status", "WAITING") if snapshot else "WAITING"
+            st.markdown('<div class="section-head">Trade Finder V2</div>', unsafe_allow_html=True)
+            t1, t2, t3, t4, t5, t6 = st.columns(6)
+            t1.metric("V2 Status", tf2_status)
+            t2.metric("V2 Score", f"{tf2.get('score', '—')}/100" if snapshot else "—")
+            t3.metric("15M", mtf15.get("arrow", "—") if snapshot else "—")
+            t4.metric("30M", mtf30.get("arrow", "—") if snapshot else "—")
+            t5.metric("60M", mtf60.get("arrow", "—") if snapshot else "—")
+            t6.metric("OI Bias", tf2.get("oi_bias", "—") if snapshot else "—")
+            if snapshot and tf2.get("option", {}).get("candidate"):
+                cand = tf2["option"]["candidate"]
+                st.caption(
+                    f"Candidate: {cand.get('type')} {cand.get('strike')} • "
+                    f"Delta {cand.get('delta', 0):.2f} • Theta {cand.get('theta', 0):.2f} • "
+                    f"50-Point Path {'PASS' if tf2.get('swing_50_pass') else 'FAIL'}"
+                )
+
             st.markdown('<div class="section-head">5/8 EMA Momentum Filter</div>', unsafe_allow_html=True)
             s1, s2, s3, s4, s5 = st.columns(5)
             s1.metric("EMA 5", f"{snap['ema_5']:,.2f}" if snap.get("ema_5") is not None else "—")
@@ -3839,6 +3897,7 @@ def dashboard(user, workspace):
     # updates every second instead of rerunning/repainting the whole page.
     # This removes the visible 1-second full-page blink while keeping the FYERS
     # WebSocket/live-price and paper-monitoring updates running automatically.
+    
     def _render_full_dashboard():
         # Invisible polling fragment. During market close it performs at most one
         # strategy evaluation; during live hours it polls for new candle/strategy
@@ -4029,6 +4088,27 @@ def dashboard(user, workspace):
         elif signal == "WAIT" and level_setup.get("status") == "NO TRADE":
             reasons.append("NO_MEANINGFUL_CLEAR_PATH")
 
+        # ---------------- Trade Finder V2 ----------------
+        try:
+            mtf_state = tf2_mtf_confirmation(access_token, active_app_id, symbol)
+        except Exception as exc:
+            mtf_state = {15: {"resolution": 15, "direction": None, "arrow": "—", "status": "ERROR", "error": str(exc)},
+                         30: {"resolution": 30, "direction": None, "arrow": "—", "status": "ERROR", "error": str(exc)},
+                         60: {"resolution": 60, "direction": None, "arrow": "—", "status": "ERROR", "error": str(exc)}}
+        oi_view = tf2_update_oi_history(option_summary, live_price)
+        tf2_result = tf2_trade_finder(
+            df, direction, bias, option_summary, option_chain_df, oi_view,
+            mtf_state, live_price, levels, level_setup
+        )
+        if news_block or not data_ok or not risk_ok:
+            signal = "BLOCKED"
+        elif tf2_result.get("hard_pass"):
+            signal = "BUY" if direction == "LONG" else "SELL"
+        else:
+            signal = "WAIT"
+            reasons.extend([f"TF2:{x}" for x in tf2_result.get("blockers", [])])
+        reasons.append("TRADE_FINDER_V2_CONFIRMED" if tf2_result.get("hard_pass") else "TRADE_FINDER_V2_PENDING")
+
         pending_confirmations = []
         if direction and not confirmation_flags["sweep_confirmed"]:
             pending_confirmations.append("SWEEP")
@@ -4144,13 +4224,17 @@ def dashboard(user, workspace):
             "entry_alert": signal in ("BUY", "SELL"),
             "reasons": reasons,
             "invalidations": invalidations,
+            "trade_finder_v2": tf2_result,
+            "mtf_15m": mtf_state.get(15, {}),
+            "mtf_30m": mtf_state.get(30, {}),
+            "mtf_60m": mtf_state.get(60, {}),
+            "oi_history_v2": oi_view,
         }
     
         # Confirmed strategy only: until this exists, the strategy region remains blank.
         strategy_available = bool(
             signal in ("BUY", "SELL")
-            and level_setup.get("status") == "CONFIRMED"
-            and ema_state.get("confirmed", False)
+            and tf2_result.get("hard_pass", False)
             and data_ok
             and risk_ok
         )
@@ -4187,6 +4271,11 @@ def dashboard(user, workspace):
             "ema_spread": float(df["ema_5_8_spread"].iloc[-1]),
             "ema_state": ema_state,
             "level_setup": level_setup,
+            "trade_finder_v2": tf2_result,
+            "mtf_15m": mtf_state.get(15, {}),
+            "mtf_30m": mtf_state.get(30, {}),
+            "mtf_60m": mtf_state.get(60, {}),
+            "oi_history_v2": oi_view,
             "rsi": float(df["rsi"].iloc[-1]) if pd.notna(df["rsi"].iloc[-1]) else None,
             "atr": float(df["atr"].iloc[-1]) if pd.notna(df["atr"].iloc[-1]) else None,
             "adx": adx_value,
@@ -4287,6 +4376,30 @@ def dashboard(user, workspace):
             elif signal in ("BUY", "SELL"):
                 st.success(f"{signal} candidate: score ≥ 75 and mandatory risk checks passed.")
     
+            tf2 = snap.get("trade_finder_v2", {}) or {}
+            cand = (tf2.get("option", {}) or {}).get("candidate") or {}
+            st.markdown('<div class="section-head">TRADE FINDER V2 • CONFIRMED SETUP</div>', unsafe_allow_html=True)
+            f1, f2, f3, f4, f5, f6 = st.columns(6)
+            f1.metric("Option", f"{cand.get('type', '—')} {cand.get('strike', '—')}")
+            f2.metric("Delta", f"{cand.get('delta', 0):.2f}" if cand else "—")
+            f3.metric("Theta", f"{cand.get('theta', 0):.2f}" if cand else "—")
+            f4.metric("PCR", f"{tf2.get('pcr', 0):.2f}" if tf2.get('pcr') is not None else "—")
+            f5.metric("50P Path", f"{tf2.get('clear_path', 0):.1f}" if tf2.get('clear_path') is not None else "—")
+            f6.metric("15M Move", f"{tf2.get('expected_move_15m', 0):.1f}" if tf2.get('expected_move_15m') is not None else "—")
+            h = tf2.get("oi_history_v2", {}) or {}
+            if h.get("frames"):
+                st.markdown("**Intraday OI History**")
+                hc = st.columns(3)
+                for idx, minutes in enumerate((15, 30, 60)):
+                    fr = (h.get("frames", {}) or {}).get(minutes, {})
+                    if fr.get("status") == "READY":
+                        hc[idx].metric(f"{minutes}M OI", f"CE {fr.get('call_oi_delta', 0):+,.0f} / PE {fr.get('put_oi_delta', 0):+,.0f}")
+                    else:
+                        hc[idx].metric(f"{minutes}M OI", "WARMING")
+            blockers = tf2.get("blockers", []) or []
+            if blockers:
+                st.caption("V2 blockers: " + " • ".join(blockers))
+
             st.markdown('<div class="section-head">Entry Confirmation</div>', unsafe_allow_html=True)
             ec1, ec2, ec3, ec4 = st.columns(4)
             ec1.metric("Entry Score", f"{score}/75")
@@ -4586,149 +4699,6 @@ def dashboard(user, workspace):
     _render_full_dashboard()
 
 # ============================================================
-# PASSWORD RECOVERY: DEFAULT SUPABASE EMAIL (NO CUSTOM SMTP)
-# ============================================================
-# IMPORTANT: Supabase's default reset link uses the browser URL fragment
-# (#access_token=...&refresh_token=...). The fragment never reaches the
-# Streamlit Python backend. Therefore the most reliable no-SMTP solution is
-# to complete the recovery entirely in the browser with Supabase JS.
-#
-# The component is blank during normal login. When a recovery fragment is
-# present, it reads the fragment in the top-level browser URL, creates a
-# recovery session with Supabase JS, lets the user set a new password, then
-# redirects back to the clean Trade Easy login URL.
-
-def _browser_password_recovery():
-    """Handle Supabase's default password-reset URL entirely in the browser.
-
-    Supabase's default/implicit recovery flow returns access_token and
-    refresh_token in the URL fragment (#...). The browser receives that
-    fragment; Streamlit's Python backend does not. Using st.html with
-    unsafe_allow_javascript=True keeps the token in the browser and avoids
-    the iframe limitation of components.html.
-
-    No custom SMTP is required.
-    """
-    try:
-        st.html(
-            f"""
-            <div id="te-recovery-overlay" style="display:none;position:fixed;inset:0;z-index:2147483647;background:#08111f;color:#fff;font-family:Arial,sans-serif;padding:24px;box-sizing:border-box;overflow:auto;">
-              <div style="max-width:520px;margin:70px auto;background:#111c2e;border:1px solid rgba(255,255,255,.15);border-radius:20px;padding:30px;box-shadow:0 20px 70px rgba(0,0,0,.45);">
-                <h2 style="margin:0 0 8px;font-size:28px;">🔐 Set New Password</h2>
-                <p id="te-recovery-msg" style="color:#b8c5d9;line-height:1.5;">Password reset link verify हो रही है...</p>
-                <div id="te-recovery-form" style="display:none;">
-                  <label style="display:block;margin:16px 0 7px;">New Password</label>
-                  <input id="te-new-password" type="password" autocomplete="new-password" style="width:100%;padding:13px;border-radius:10px;border:1px solid #44546b;background:#0b1422;color:#fff;box-sizing:border-box;font-size:16px;">
-                  <label style="display:block;margin:16px 0 7px;">Confirm New Password</label>
-                  <input id="te-confirm-password" type="password" autocomplete="new-password" style="width:100%;padding:13px;border-radius:10px;border:1px solid #44546b;background:#0b1422;color:#fff;box-sizing:border-box;font-size:16px;">
-                  <button id="te-update-password" style="margin-top:22px;width:100%;padding:14px;border:0;border-radius:10px;background:#2563eb;color:#fff;font-size:16px;font-weight:700;cursor:pointer;">Update Password</button>
-                </div>
-              </div>
-            </div>
-            <script>
-            (() => {{
-              const overlay = document.getElementById('te-recovery-overlay');
-              const msg = document.getElementById('te-recovery-msg');
-              const form = document.getElementById('te-recovery-form');
-              const btn = document.getElementById('te-update-password');
-              const pw1 = document.getElementById('te-new-password');
-              const pw2 = document.getElementById('te-confirm-password');
-              if (!overlay || !msg || !form || !btn) return;
-
-              const SUPABASE_URL = {SUPABASE_URL!r};
-              const SUPABASE_KEY = {SUPABASE_PUBLISHABLE_KEY!r};
-
-              function parseRecoveryFragment() {{
-                const hash = window.location.hash || '';
-                if (!hash || !hash.includes('access_token=')) return null;
-                const params = new URLSearchParams(hash.replace(/^#/, ''));
-                const type = (params.get('type') || '').toLowerCase();
-                const accessToken = params.get('access_token');
-                const refreshToken = params.get('refresh_token');
-                if (type !== 'recovery' || !accessToken) return null;
-                return {{ accessToken, refreshToken, type }};
-              }}
-
-              function cleanAndReload() {{
-                try {{
-                  const u = new URL(window.location.href);
-                  u.hash = '';
-                  u.searchParams.delete('reset_password');
-                  u.searchParams.delete('recovery_access_token');
-                  u.searchParams.delete('recovery_refresh_token');
-                  u.searchParams.delete('recovery_type');
-                  u.searchParams.delete('password_reset_success');
-                  window.location.replace(u.toString());
-                }} catch (_) {{
-                  window.location.reload();
-                }}
-              }}
-
-              async function updatePassword(accessToken, password) {{
-                const response = await fetch(SUPABASE_URL.replace(/\/$/, '') + '/auth/v1/user', {{
-                  method: 'PUT',
-                  headers: {{
-                    'apikey': SUPABASE_KEY,
-                    'Authorization': 'Bearer ' + accessToken,
-                    'Content-Type': 'application/json'
-                  }},
-                  body: JSON.stringify({{ password }})
-                }});
-                let body = null;
-                try {{ body = await response.json(); }} catch (_) {{}}
-                if (!response.ok) {{
-                  const detail = body && (body.msg || body.message || body.error_description || body.error) ? (body.msg || body.message || body.error_description || body.error) : ('HTTP ' + response.status);
-                  throw new Error(detail);
-                }}
-                return body;
-              }}
-
-              async function runRecovery() {{
-                const recovery = parseRecoveryFragment();
-                if (!recovery) return;
-
-                overlay.style.display = 'block';
-                msg.textContent = 'Recovery link verified. नया password सेट करें।';
-                form.style.display = 'block';
-                try {{ if (document.body) document.body.style.overflow = 'hidden'; }} catch (_) {{}}
-
-                btn.onclick = async () => {{
-                  const a = pw1.value || '';
-                  const b = pw2.value || '';
-                  if (a.length < 8) {{ msg.textContent = 'Password कम-से-कम 8 characters का होना चाहिए।'; return; }}
-                  if (a !== b) {{ msg.textContent = 'दोनों passwords match नहीं कर रहे हैं।'; return; }}
-
-                  btn.disabled = true;
-                  btn.textContent = 'Updating...';
-                  try {{
-                    await updatePassword(recovery.accessToken, a);
-                    msg.textContent = '✅ Password successfully updated. Login page खुल रहा है...';
-                    setTimeout(cleanAndReload, 900);
-                  }} catch (e) {{
-                    msg.textContent = 'Password update failed: ' + (e && e.message ? e.message : 'Unknown error');
-                    btn.disabled = false;
-                    btn.textContent = 'Update Password';
-                  }}
-                }};
-              }}
-
-              runRecovery().catch(e => {{
-                overlay.style.display = 'block';
-                msg.textContent = 'Password reset link verify नहीं हो सका: ' + (e && e.message ? e.message : 'Unknown error');
-              }});
-            }})();
-            </script>
-            """,
-            unsafe_allow_javascript=True,
-            width="stretch",
-        )
-    except Exception as exc:
-        # Do not break the normal login/dashboard if the optional recovery UI
-        # cannot render on an older Streamlit runtime.
-        st.session_state["trade_easy_recovery_ui_error"] = str(exc)
-
-
-# ============================================================
 # APP ROUTER
 # ============================================================
 
@@ -4736,12 +4706,6 @@ def main():
     # Restore the locally protected FYERS access token before rendering the dashboard.
     # This survives F5/Ctrl+R and Streamlit session recreation.
     _restore_fyers_session()
-
-    # Handle the URL fragment produced by Supabase's DEFAULT password-reset
-    # email. This runs before Python reads st.query_params because fragments
-    # are browser-only and are not sent to the Streamlit server.
-    _browser_password_recovery()
-
     # Production credentials are loaded from Streamlit Secrets/environment.
     if FYERS_CONFIG_APP_ID:
         st.session_state.setdefault("fyers_app_id", FYERS_CONFIG_APP_ID)
@@ -4750,11 +4714,6 @@ def main():
     user = get_current_user()
 
     oauth_code = st.query_params.get("code")
-    recovery_token_hash = st.query_params.get("token_hash")
-    recovery_type = st.query_params.get("type")
-    recovery_access_token = st.query_params.get("recovery_access_token")
-    recovery_refresh_token = st.query_params.get("recovery_refresh_token")
-    recovery_fragment_type = st.query_params.get("recovery_type")
     fyers_auth_code = st.query_params.get("auth_code")
     oauth_error = st.query_params.get("error")
     oauth_error_description = st.query_params.get("error_description")
@@ -4812,120 +4771,11 @@ def main():
         st.error(f"Google login failed: {oauth_error_description or oauth_error}")
         st.stop()
 
-    # ------------------------------------------------------------
-    # PASSWORD RECOVERY CALLBACK
-    # ------------------------------------------------------------
-    # IMPORTANT: Handle the password-reset callback BEFORE the normal
-    # Google OAuth callback. Supabase sends the reset code back to the
-    # deployed app; if the generic oauth_code block consumes it first,
-    # the user is returned to the normal Login page instead of seeing
-    # the Set New Password screen.
-    reset_requested = (
-        st.query_params.get("reset_password") == "1"
-        or str(recovery_type or "").lower() == "recovery"
-        or bool(st.session_state.get("password_recovery"))
-    )
-
-    # ------------------------------------------------------------
-    # PASSWORD RECOVERY: default Supabase fragment flow (NO SMTP)
-    # ------------------------------------------------------------
-    # The default Supabase email sends a recovery session in the URL fragment.
-    # The browser bridge above converts that fragment into temporary query
-    # parameters; now establish the authenticated Supabase session server-side.
-    if (
-        reset_requested
-        and recovery_access_token
-        and recovery_refresh_token
-        and str(recovery_fragment_type or "").lower() == "recovery"
-        and user is None
-    ):
-        try:
-            response = supabase.auth.set_session(
-                recovery_access_token,
-                recovery_refresh_token,
-            )
-            recovered_user = getattr(response, "user", None)
-            if recovered_user is not None:
-                user = recovered_user
-                st.session_state["password_recovery"] = True
-                clear_oauth_params()
-            else:
-                user = get_current_user()
-                if user is not None:
-                    st.session_state["password_recovery"] = True
-                    clear_oauth_params()
-
-            if user is None:
-                st.error("Password reset session नहीं बन सकी। नया reset link request करें।")
-                st.stop()
-        except Exception as e:
-            st.error(f"Password reset session verification failed: {type(e).__name__}: {e}")
-            st.stop()
-
-    # ------------------------------------------------------------
-    # PASSWORD RECOVERY: token-hash flow (recommended for Streamlit)
-    # ------------------------------------------------------------
-    # Supabase's normal email confirmation can return a session in the URL
-    # fragment (#access_token=...), which a Python/Streamlit server cannot
-    # read. Our recovery email template can instead send token_hash + type
-    # to this page. verify_otp() exchanges that token for a real session.
-    if reset_requested and recovery_token_hash and user is None:
-        try:
-            response = supabase.auth.verify_otp({
-                "token_hash": recovery_token_hash,
-                "type": "recovery",
-            })
-            recovered_user = getattr(response, "user", None)
-            if recovered_user is not None:
-                user = recovered_user
-                st.session_state["password_recovery"] = True
-                clear_oauth_params()
-            else:
-                user = get_current_user()
-                if user is not None:
-                    st.session_state["password_recovery"] = True
-                    clear_oauth_params()
-
-            if user is None:
-                st.error("Password reset link invalid या expired है। नया reset link request करें।")
-                st.stop()
-        except Exception as e:
-            st.error(f"Password reset verification failed: {type(e).__name__}: {e}")
-            st.stop()
-
-    # ------------------------------------------------------------
-    # PASSWORD RECOVERY: PKCE code fallback
-    # ------------------------------------------------------------
-    if reset_requested and oauth_code and user is None:
-        try:
-            response = supabase.auth.exchange_code_for_session({"auth_code": oauth_code})
-            recovered_user = getattr(response, "user", None)
-            if recovered_user is not None:
-                user = recovered_user
-                st.session_state["password_recovery"] = True
-                clear_oauth_params()
-            else:
-                user = get_current_user()
-                if user is not None:
-                    st.session_state["password_recovery"] = True
-                    clear_oauth_params()
-
-            if user is None:
-                st.error("Password reset session नहीं बन सकी। Reset link दोबारा भेजें।")
-                st.stop()
-        except Exception as e:
-            st.error(f"Password reset callback error: {type(e).__name__}: {e}")
-            st.stop()
-
-    # ------------------------------------------------------------
-    # NORMAL GOOGLE OAUTH CALLBACK
-    # ------------------------------------------------------------
-    if oauth_code and user is None and not reset_requested:
+    if oauth_code and user is None:
         try:
             response = supabase.auth.exchange_code_for_session(
                 {"auth_code": oauth_code}
             )
-
             if getattr(response, "user", None) is not None:
                 clear_oauth_params()
                 st.rerun()
@@ -4938,7 +4788,6 @@ def main():
             clear_oauth_params()
             st.error("Google login completed, but session was not found.")
             st.stop()
-
         except Exception as e:
             user_after_error = get_current_user()
             if user_after_error is not None:
@@ -4948,48 +4797,6 @@ def main():
             clear_oauth_params()
             st.error(f"Google login callback error: {e}")
             st.stop()
-
-    if st.session_state.get("password_recovery"):
-        if user is None:
-            clear_oauth_params()
-            st.session_state.pop("password_recovery", None)
-            login_page()
-            return
-
-        st.markdown("## 🔐 Set New Password")
-        st.info("आपका password reset link सही है। नया password सेट करें।")
-        new_password = st.text_input(
-            "New Password",
-            type="password",
-            key="recovery_new_password",
-        )
-        confirm_password = st.text_input(
-            "Confirm New Password",
-            type="password",
-            key="recovery_confirm_password",
-        )
-        if st.button("Update Password", type="primary", use_container_width=True, key="recovery_update_btn"):
-            if len(new_password) < 8:
-                st.error("Password कम-से-कम 8 characters का होना चाहिए।")
-            elif new_password != confirm_password:
-                st.error("दोनों passwords match नहीं कर रहे हैं।")
-            else:
-                try:
-                    response = supabase.auth.update_user({"password": new_password})
-                    if getattr(response, "user", None) is not None:
-                        st.success("✅ Password successfully updated. अब आप Trade Easy में login कर सकते हैं।")
-                        try:
-                            supabase.auth.sign_out()
-                        except Exception:
-                            pass
-                        st.session_state.pop("password_recovery", None)
-                        clear_oauth_params()
-                        st.rerun()
-                    else:
-                        st.error("Password update failed.")
-                except Exception as e:
-                    st.error(f"Password update error: {e}")
-        st.stop()
 
     if user is None:
         login_page()
