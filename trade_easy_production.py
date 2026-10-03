@@ -2065,72 +2065,117 @@ with check (public.trade_easy_is_admin());
 
 
 def login_page():
-    """Compact, centered popup-style authentication screen."""
+    """Compact centered popup-style authentication screen."""
     st.markdown("""
     <style>
-    /* Keep the authentication experience compact instead of using the whole page. */
+    /* Compact popup: logo and form live in the same visual card. */
     .stApp {
         background:
-            radial-gradient(circle at 15% 20%, rgba(38,99,235,.22), transparent 30%),
-            radial-gradient(circle at 85% 18%, rgba(139,92,246,.18), transparent 28%),
+            radial-gradient(circle at 15% 18%, rgba(38,99,235,.20), transparent 30%),
+            radial-gradient(circle at 85% 18%, rgba(139,92,246,.16), transparent 28%),
             linear-gradient(135deg,#050b16 0%,#0a1222 48%,#060b14 100%);
     }
     [data-testid="stHeader"] { background: transparent; }
     [data-testid="stToolbar"] { display:none; }
-    .auth-shell {
-        min-height: 82vh;
-        display:flex;
-        align-items:center;
-        justify-content:center;
-        padding:28px 12px;
+
+    /* The authentication row itself becomes the popup. */
+    .stApp .stHorizontalBlock {
+        max-width: 460px !important;
+        margin: 7vh auto 0 auto !important;
+        align-items: stretch !important;
     }
-    .auth-card {
-        width:100%;
-        max-width:430px;
-        padding:26px 28px 24px;
-        border-radius:22px;
-        background:rgba(12,20,35,.88);
-        border:1px solid rgba(148,163,184,.20);
-        box-shadow:0 24px 80px rgba(0,0,0,.48), inset 0 1px 0 rgba(255,255,255,.05);
-        backdrop-filter:blur(18px);
+    .stApp .stHorizontalBlock > div[data-testid="column"] {
+        display: none;
     }
-    .auth-brand { text-align:center; margin-bottom:18px; }
-    .auth-logo {
-        width:52px;height:52px;margin:0 auto 10px;border-radius:16px;
+    .stApp .stHorizontalBlock > div[data-testid="column"]:nth-child(2) {
+        display: block !important;
+        flex: 0 0 100% !important;
+        width: 100% !important;
+        max-width: 100% !important;
+        padding: 24px 30px 22px !important;
+        border-radius: 22px !important;
+        background: rgba(12,20,35,.92) !important;
+        border: 1px solid rgba(148,163,184,.20) !important;
+        box-shadow: 0 24px 80px rgba(0,0,0,.48), inset 0 1px 0 rgba(255,255,255,.05) !important;
+        backdrop-filter: blur(18px);
+        box-sizing: border-box !important;
+    }
+
+    .te-auth-brand { text-align:center; margin:0 0 12px 0; }
+    .te-auth-logo {
+        width:52px;height:52px;margin:0 auto 7px;border-radius:15px;
         display:flex;align-items:center;justify-content:center;
         font-size:25px;font-weight:900;
         background:linear-gradient(135deg,#2563eb,#7c3aed);
-        color:#fff;box-shadow:0 10px 30px rgba(37,99,235,.28);
+        color:#fff;box-shadow:0 9px 25px rgba(37,99,235,.25);
     }
-    .auth-title { color:#f8fafc;font-size:25px;font-weight:850;letter-spacing:-.4px; }
-    .auth-sub { color:#94a3b8;font-size:12px;margin-top:4px; }
-    .auth-caption { color:#64748b;font-size:11px;text-align:center;margin-top:15px; }
-    div[data-testid="stTabs"] button { font-size:13px; font-weight:700; }
-    div[data-testid="stTextInput"] input {
+    .te-auth-title { color:#f8fafc;font-size:24px;font-weight:850;line-height:1.05;letter-spacing:-.4px; }
+    .te-auth-sub { color:#94a3b8;font-size:11px;margin-top:4px; }
+
+    div[data-testid="stTabs"] { margin-top: 2px !important; }
+    div[data-testid="stTabs"] button { font-size:13px !important; font-weight:700 !important; }
+    div[data-testid="stTabsContent"] { padding-top: 10px !important; }
+
+    /* White input boxes with dark text for clear typing. */
+    div[data-testid="stTextInput"] { margin-bottom: 7px !important; }
+    div[data-testid="stTextInput"] label {
+        color:#cbd5e1 !important;
+        font-size:12px !important;
+        font-weight:600 !important;
+        margin-bottom:3px !important;
+    }
+    div[data-testid="stTextInput"] input,
+    div[data-testid="stTextInput"] input:focus {
+        background:#ffffff !important;
+        color:#111827 !important;
+        -webkit-text-fill-color:#111827 !important;
+        caret-color:#111827 !important;
+        border:1px solid #cbd5e1 !important;
         border-radius:10px !important;
-        background:rgba(15,23,42,.72) !important;
+        box-shadow:none !important;
+        min-height:40px !important;
     }
+    div[data-testid="stTextInput"] input::placeholder {
+        color:#6b7280 !important;
+        opacity:1 !important;
+    }
+    div[data-testid="stTextInput"] input:focus {
+        border-color:#64748b !important;
+        box-shadow:0 0 0 2px rgba(59,130,246,.14) !important;
+    }
+
+    div.stButton { margin-top:7px !important; }
     div.stButton > button {
         border-radius:10px !important;
         min-height:40px !important;
         font-weight:700 !important;
     }
+    .te-auth-caption {
+        color:#64748b;font-size:10px;text-align:center;margin-top:10px;
+    }
+
+    @media (max-width: 640px) {
+        .stApp .stHorizontalBlock {
+            max-width: calc(100% - 24px) !important;
+            margin-top: 4vh !important;
+        }
+        .stApp .stHorizontalBlock > div[data-testid="column"]:nth-child(2) {
+            padding:20px 18px 18px !important;
+        }
+    }
     </style>
-    <div class="auth-shell">
-      <div class="auth-card">
-        <div class="auth-brand">
-          <div class="auth-logo">TE</div>
-          <div class="auth-title">Trade Easy</div>
-          <div class="auth-sub">Index Trading Confirmation &amp; Risk Control</div>
-        </div>
-      </div>
-    </div>
     """, unsafe_allow_html=True)
 
-    # Streamlit widgets remain in the centered page column so the actual form
-    # stays compact and aligned with the popup card above.
     left, center, right = st.columns([1.15, 1.7, 1.15])
     with center:
+        st.markdown("""
+        <div class="te-auth-brand">
+          <div class="te-auth-logo">TE</div>
+          <div class="te-auth-title">Trade Easy</div>
+          <div class="te-auth-sub">Index Trading Confirmation &amp; Risk Control</div>
+        </div>
+        """, unsafe_allow_html=True)
+
         login_tab, signup_tab = st.tabs(["🔐 Login", "🆕 Create Account"])
 
         with login_tab:
@@ -2209,7 +2254,7 @@ def login_page():
                 except Exception as e:
                     st.error(f"Signup error: {e}")
 
-        st.markdown('<div class="auth-caption">Secure authentication • Trade Easy</div>', unsafe_allow_html=True)
+        st.markdown('<div class="te-auth-caption">Secure authentication • Trade Easy</div>', unsafe_allow_html=True)
 
 
 # ============================================================
