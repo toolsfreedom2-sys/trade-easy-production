@@ -3588,6 +3588,11 @@ def dashboard(user, workspace):
     paper_user_id = getattr(user, "id", "")
     paper_workspace_id = workspace.get("id") if workspace else "default"
     paper_state = load_paper_state(paper_user_id, paper_workspace_id)
+
+    # Paper reset is rendered later in a dedicated permanent root, immediately
+    # before the Option Chain. Keeping it there makes the control visible in the
+    # same viewport as the strategy/dashboard panels instead of placing it above
+    # the page title where it can be missed after a scroll.
     # Normalize any legacy/open paper position to the permanent paper quantity.
     if paper_state.get("open_position"):
         paper_state["open_position"]["quantity"] = PAPER_FIXED_QUANTITY
@@ -4141,6 +4146,46 @@ def dashboard(user, workspace):
         _v2_cached_tfs = st.session_state.get("trade_easy_v2_timeframes") or {15:{}, 30:{}, 60:{}}
         _v2_cached_oi = st.session_state.get("trade_easy_v2_oi_history") or {}
         render_trade_finder_v2(_v2_cached_result, _v2_cached_tfs, _v2_cached_oi)
+
+    # Permanent Paper Trading control root. This is intentionally outside every
+    # live fragment and every replaceable strategy root. It therefore remains
+    # visible on WAITING, market-closed, no-data and live states alike.
+    paper_control_root = st.empty()
+    with paper_control_root.container():
+        st.markdown('<div class="section-head">🧹 Paper Trading Controls</div>', unsafe_allow_html=True)
+        reset_col, reset_info = st.columns([1.20, 3.80])
+        with reset_col:
+            if st.button(
+                "🧹 RESET PAPER TRADING",
+                use_container_width=True,
+                type="secondary",
+                key="reset_paper_trading_permanent",
+                help="Reset only paper-trading state: today's trades, P&L, open paper position and audit history. FYERS/live data and strategy settings are unchanged.",
+            ):
+                paper_state["date"] = pd.Timestamp.now(tz="Asia/Kolkata").strftime("%Y-%m-%d")
+                paper_state["daily_realized_pnl"] = 0.0
+                paper_state["trades_today"] = 0
+                paper_state["open_position"] = None
+                paper_state["last_entry_signature"] = None
+                paper_state["trade_history"] = []
+                paper_state["audit_log"] = []
+                paper_state["paper_kill_switch"] = False
+                save_paper_state(paper_user_id, paper_workspace_id, paper_state)
+                st.session_state.pop("trade_easy_last_paper_event", None)
+                st.session_state.pop("trade_easy_last_entry", None)
+                st.session_state["trade_easy_paper_display_version"] = int(st.session_state.get("trade_easy_paper_display_version", 0)) + 1
+                st.session_state["paper_reset_notice"] = True
+                st.rerun()
+        with reset_info:
+            current_position = "OPEN" if paper_state.get("open_position") else "FLAT"
+            current_trades = int(paper_state.get("trades_today", 0))
+            current_pnl = float(paper_state.get("daily_realized_pnl", 0.0))
+            st.caption(
+                "Reset केवल Paper Trading को साफ करता है — Live/FYERS data, strategy settings और fixed Qty 65 सुरक्षित रहते हैं। "
+                f"Current: {current_position} • Trades: {current_trades} • P&L: ₹{current_pnl:,.2f}"
+            )
+        if st.session_state.pop("paper_reset_notice", False):
+            st.success("✅ Paper Trading reset हो गया — P&L ₹0, trades 0, open position साफ।")
 
     # Permanent dashboard shell. Cards are always visible and are populated with
     # the last completed-candle / last-known strategy snapshot whenever available.
@@ -4941,33 +4986,6 @@ def dashboard(user, workspace):
             pe3.metric("Realized P&L", f"₹{daily_pnl:,.2f}")
             pe4.metric("Unrealized P&L", f"₹{paper_unrealized:,.2f}")
 
-            # Prominent PAPER-only reset control. Kept in the main dashboard so it is
-            # always visible; it never disconnects FYERS or sends a broker order.
-            reset_col, info_col = st.columns([1, 3])
-            with reset_col:
-                if st.button(
-                    "🧹 RESET PAPER TRADING DAY",
-                    use_container_width=True,
-                    type="secondary",
-                    key="reset_paper_day_main",
-                    help="Clears paper trades, today's realized P&L, trade counters, audit history and any open paper position. Live data and strategy settings are unchanged.",
-                ):
-                    paper_state["date"] = pd.Timestamp.now(tz="Asia/Kolkata").strftime("%Y-%m-%d")
-                    paper_state["daily_realized_pnl"] = 0.0
-                    paper_state["trades_today"] = 0
-                    paper_state["open_position"] = None
-                    paper_state["last_entry_signature"] = None
-                    paper_state["trade_history"] = []
-                    paper_state["audit_log"] = []
-                    paper_state["paper_kill_switch"] = False
-                    save_paper_state(paper_user_id, paper_workspace_id, paper_state)
-                    st.session_state["paper_reset_notice"] = True
-                    st.rerun()
-            with info_col:
-                st.caption("Reset केवल Paper Trading history/P&L को साफ करता है। Live data, strategy settings और fixed Qty 65 सुरक्षित रहते हैं।")
-            if st.session_state.pop("paper_reset_notice", False):
-                st.success("✅ Paper Trading reset हो गया — P&L ₹0, trades 0, open position साफ।")
-
             if paper_state.get("open_position"):
                 pp = paper_state["open_position"]
                 pcols = st.columns(6)
@@ -5139,7 +5157,7 @@ def dashboard(user, workspace):
     # a new confirmed strategy or paper-trade event is detected.
     if hasattr(st, "fragment"):
         _render_full_dashboard = st.fragment(
-            run_every="2s", key="trade_easy_strategy_dashboard"
+            run_every="1s", key="trade_easy_strategy_dashboard"
         )(_render_full_dashboard)
     _render_full_dashboard()
 
