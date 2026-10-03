@@ -3329,6 +3329,45 @@ def dashboard(user, workspace):
     @media (max-width: 900px) { .live-ticker-grid { grid-template-columns: repeat(3, minmax(0,1fr)); } }
     /* Keep the browser viewport stable while the fragment updates. */
     html, body { scroll-behavior: auto !important; }
+
+    /* TOP HEADER + LOGOUT VISIBILITY FIX
+       Keep Streamlit's top header from appearing as a white strip over the
+       dashboard controls, and make dashboard action buttons readable. */
+    [data-testid="stHeader"] {
+        background: #07111f !important;
+        border-bottom: 1px solid rgba(148,163,184,.14) !important;
+        box-shadow: none !important;
+        z-index: 1000 !important;
+    }
+    [data-testid="stHeader"]::before {
+        background: #07111f !important;
+    }
+    [data-testid="stToolbar"] {
+        background: transparent !important;
+    }
+    /* Dashboard buttons: dark background + white text, including Logout. */
+    div[data-testid="stButton"] > button {
+        background: #172033 !important;
+        color: #ffffff !important;
+        border: 1px solid rgba(148,163,184,.30) !important;
+        box-shadow: 0 4px 12px rgba(0,0,0,.18) !important;
+    }
+    div[data-testid="stButton"] > button:hover {
+        background: #22304a !important;
+        color: #ffffff !important;
+        border-color: rgba(96,165,250,.55) !important;
+    }
+    div[data-testid="stButton"] > button:focus,
+    div[data-testid="stButton"] > button:focus-visible {
+        color: #ffffff !important;
+        outline: 2px solid rgba(96,165,250,.45) !important;
+        outline-offset: 1px !important;
+    }
+    /* Give the dashboard's top row enough clearance below Streamlit header. */
+    [data-testid="stAppViewContainer"] .main .block-container {
+        padding-top: 3.5rem !important;
+    }
+
     @media (max-width: 900px) {
         .state-title { font-size: 30px; }
         h1 { font-size: 1.65rem !important; }
