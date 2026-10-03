@@ -71,9 +71,9 @@ SUPABASE_PUBLISHABLE_KEY = _config_value("sb_publishable_gJmLuOGIPSibBWBpHY3uow_
 TRADE_EASY_PUBLIC_URL = _config_value("https://tradeeasy.streamlit.app")
 REDIRECT_URL = _config_value("https://tradeeasy.streamlit.app/)
 
-FYERS_CONFIG_APP_ID = ("K20QNFRUC0-100")
-FYERS_CONFIG_SECRET = ("08VGJF3CU4")
-FYERS_REDIRECT_URI = ("https://tradeeasy.streamlit.app/")
+FYERS_CONFIG_APP_ID = _config_value("K20QNFRUC0-100")
+FYERS_CONFIG_SECRET = _config_value("08VGJF3CU4")
+FYERS_REDIRECT_URI = _config_value("https://tradeeasy.streamlit.app/")
 if not FYERS_REDIRECT_URI and TRADE_EASY_PUBLIC_URL:
     FYERS_REDIRECT_URI = TRADE_EASY_PUBLIC_URL.rstrip("/") + "/"
 
