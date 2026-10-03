@@ -1837,13 +1837,6 @@ def admin_bootstrap_admin_password(email, bootstrap_token, new_password):
 
 
 def admin_update_profile(user_id, *, role=None, status=None):
-    """Update account access using the trusted server client when available.
-
-    Account blocking is a security-sensitive operation. Prefer Supabase's
-    server-only Admin client so RLS/session state from the administrator's
-    normal browser session cannot silently prevent or alter the update.
-    Verify the stored row after the write before reporting success.
-    """
     payload = {}
     if role is not None:
         payload["role"] = str(role).lower()
@@ -1852,30 +1845,9 @@ def admin_update_profile(user_id, *, role=None, status=None):
     if not payload:
         return False, "कोई बदलाव नहीं।"
     payload["updated_at"] = _utc_now().isoformat()
-
     try:
-        client = get_supabase_admin() if SUPABASE_SECRET_KEY else supabase
-        result = client.table("profiles").update(payload).eq("id", user_id).execute()
-
-        # Do not trust a UI success response alone. Read the row back and verify
-        # the values that were requested are actually stored in Supabase.
-        verify = (
-            client.table("profiles")
-            .select("id,email,role,status,updated_at")
-            .eq("id", user_id)
-            .limit(1)
-            .execute()
-        )
-        row = verify.data[0] if verify.data else None
-        if row is None:
-            return False, "Profile update response मिला, लेकिन saved profile verify नहीं हो सकी।"
-
-        if role is not None and str(row.get("role") or "").lower() != str(role).lower():
-            return False, "Role update verify नहीं हुआ।"
-        if status is not None and str(row.get("status") or "").lower() != str(status).lower():
-            return False, "Account status update verify नहीं हुआ।"
-
-        return True, None
+        result = supabase.table("profiles").update(payload).eq("id", user_id).execute()
+        return bool(result.data), None if result.data else "Profile update नहीं हुआ।"
     except Exception as exc:
         return False, str(exc)
 
@@ -2059,81 +2031,6 @@ def subscription_block_page(data, user):
             pass
         clear_oauth_params()
         st.rerun()
-
-
-def account_block_page(profile, user):
-    """Stop all normal-user application access when the profile is blocked.
-
-    This is intentionally separate from subscription blocking: an account-level
-    block takes precedence over subscription status and must prevent access to
-    the trading dashboard, FYERS data, option chain, V2 and paper trading.
-    """
-    st.markdown("## 🔒 Account Access Blocked")
-    st.error("यह Trade Easy account administrator द्वारा blocked है। Trading Dashboard access बंद है।")
-    st.info("Account को दोबारा active करने के लिए administrator से संपर्क करें।")
-    st.caption(f"User: {getattr(user, 'email', '')}")
-    status = str((profile or {}).get("status") or "blocked").upper()
-    st.caption(f"Account Status: {status}")
-    if st.button("Logout", key="account_block_logout", use_container_width=True):
-        try:
-            supabase.auth.sign_out()
-        except Exception:
-            pass
-        _clear_fyers_session()
-        clear_oauth_params()
-        st.rerun()
-
-
-def _refresh_current_account_access(user_id, min_interval=5.0):
-    """Re-check the logged-in user's profile status without disturbing the UI.
-
-    Returns:
-      True  -> explicitly active/allowed
-      False -> explicitly blocked/non-active
-      None  -> transient profile lookup error; preserve current dashboard state
-
-    The short cache keeps the live ticker from hammering Supabase while still
-    making an admin block effective within a few seconds for an already-open
-    dashboard session.
-    """
-    uid = str(user_id or "").strip()
-    if not uid:
-        return False
-
-    now = time.time()
-    last_at = float(st.session_state.get("trade_easy_account_access_checked_at", 0.0))
-    cached = st.session_state.get("trade_easy_account_access_allowed")
-    if cached is not None and (now - last_at) < float(min_interval):
-        return bool(cached)
-
-    try:
-        result = (
-            supabase.table("profiles")
-            .select("id,status,role")
-            .eq("id", uid)
-            .limit(1)
-            .execute()
-        )
-        rows = result.data or []
-        if not rows:
-            # Unknown/missing profile must never be treated as ACTIVE by the
-            # access watchdog. Preserve the current UI on a transient error,
-            # but fail closed when the profile is genuinely absent.
-            st.session_state["trade_easy_account_access_checked_at"] = now
-            st.session_state["trade_easy_account_access_allowed"] = False
-            st.session_state["trade_easy_account_status"] = "MISSING"
-            return False
-
-        status = str(rows[0].get("status") or "active").strip().lower()
-        allowed = status == "active"
-        st.session_state["trade_easy_account_status"] = status
-        st.session_state["trade_easy_account_access_checked_at"] = now
-        st.session_state["trade_easy_account_access_allowed"] = allowed
-        return allowed
-    except Exception as exc:
-        st.session_state["trade_easy_account_access_error"] = str(exc)
-        st.session_state["trade_easy_account_access_checked_at"] = now
-        return None
 
 
 def render_admin_fyers_settings():
@@ -3692,28 +3589,6 @@ def dashboard(user, workspace):
     paper_workspace_id = workspace.get("id") if workspace else "default"
     paper_state = load_paper_state(paper_user_id, paper_workspace_id)
 
-    # ================================================================
-    # ACCOUNT ACCESS WATCHDOG
-    # Re-check the current profile status independently of FYERS/market data.
-    # This is intentionally outside the trading fragment so an already-open
-    # dashboard is locked out even when FYERS is disconnected or the market is
-    # closed.
-    # ================================================================
-    @st.fragment(run_every="2s", key="trade_easy_account_access_watchdog")
-    def _account_access_watchdog():
-        if st.session_state.get("trade_easy_account_blocked"):
-            return
-        access_ok = _refresh_current_account_access(paper_user_id, min_interval=2.0)
-        if access_ok is False:
-            st.session_state["trade_easy_account_blocked"] = True
-            _clear_fyers_session()
-            # App-level rerun is required here so the main router executes the
-            # authoritative profile-status gate and replaces the dashboard with
-            # the Account Access Blocked page.
-            st.rerun()
-
-    _account_access_watchdog()
-
     # Paper reset is rendered later in a dedicated permanent root, immediately
     # before the Option Chain. Keeping it there makes the control visible in the
     # same viewport as the strategy/dashboard panels instead of placing it above
@@ -4116,16 +3991,6 @@ def dashboard(user, workspace):
             st.session_state["trade_easy_market_label_rendered"] = label
 
     def _render_live_ticker():
-        # Account-level access is rechecked periodically even while the dashboard
-        # is already open. An admin block therefore takes effect without waiting
-        # for the user to log out manually.
-        access_state = _refresh_current_account_access(paper_user_id, min_interval=5.0)
-        if access_state is False:
-            st.session_state["trade_easy_account_blocked"] = True
-            _clear_fyers_session()
-            st.rerun()
-            return
-
         market_live, session_label = india_market_status()
         token = st.session_state.get("fyers_access_token")
         appid = st.session_state.get("fyers_app_id", "").strip()
@@ -5779,21 +5644,6 @@ def main():
         st.code(profile_error or "Unknown profile error")
         st.info("Supabase में `Trade_Easy_SUBSCRIPTION_SETUP.sql` एक बार run करें।")
         st.stop()
-
-    # Account-level block has higher priority than both admin and subscription
-    # access. A blocked profile must never reach the trading dashboard.
-    profile_status = str(profile.get("status", "active") or "active").strip().lower()
-    if profile_status != "active":
-        st.session_state["trade_easy_account_blocked"] = True
-        st.session_state["trade_easy_account_access_allowed"] = False
-        _clear_fyers_session()
-        account_block_page(profile, user)
-        return
-
-    # Clear a stale local block marker after the administrator restores the
-    # account to active. The next dashboard render may then run normally.
-    st.session_state.pop("trade_easy_account_blocked", None)
-    st.session_state["trade_easy_account_access_allowed"] = True
 
     # Admins bypass subscription gating so they can always manage users/plans.
     if is_admin_profile(profile):
