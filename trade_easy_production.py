@@ -4316,7 +4316,10 @@ def dashboard(user, workspace):
                     "Live price is displayed separately and is not used to repaint these cards on every tick."
                 )
 
-    _render_strategy_cards(st.session_state.get("trade_easy_last_strategy_snapshot"))
+    # Do not render strategy cards here: the live strategy fragment owns the
+    # single strategy-card render root when a FYERS session is available.
+    # Rendering the cached cards here as well caused the same dashboard blocks
+    # to appear twice before the live fragment refreshed them.
 
     access_token = st.session_state.get("fyers_access_token")
     if not access_token:
