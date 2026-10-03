@@ -738,6 +738,357 @@ def summarize_option_chain(chain_df):
             "call_wall": call_wall, "put_wall": put_wall}
 
 
+
+def _tf_clean_delta(value):
+    """Normalize broker delta to a 0..100 percentage-like value."""
+    try:
+        x=float(value)
+        if not np.isfinite(x):
+            return np.nan
+        # FYERS-style Greeks are normally decimal (-1..1); tolerate percent-like feeds too.
+        if abs(x) <= 1.5:
+            return x * 100.0
+        return x
+    except Exception:
+        return np.nan
+
+
+def _tf_theta_ok(value, low=-10.0, high=-5.0):
+    try:
+        x=float(value)
+        return bool(np.isfinite(x) and low <= x <= high)
+    except Exception:
+        return False
+
+
+def _tf_delta_ok(value, minimum=70.0):
+    try:
+        x=_tf_clean_delta(value)
+        return bool(np.isfinite(x) and x >= minimum)
+    except Exception:
+        return False
+
+
+def _tf_bool(value):
+    return bool(value) if value is not None else False
+
+
+def _tf_safe_float(value):
+    try:
+        x=float(value)
+        return x if np.isfinite(x) else np.nan
+    except Exception:
+        return np.nan
+
+
+def _tf_option_history_record(chain_df, timestamp=None):
+    """Create a compact immutable-in-session OI snapshot for 15/30/60m comparisons."""
+    if chain_df is None or chain_df.empty:
+        return None
+    try:
+        ce=chain_df[chain_df["type"].eq("CE")]
+        pe=chain_df[chain_df["type"].eq("PE")]
+        ts=float(timestamp if timestamp is not None else time.time())
+        return {
+            "ts": ts,
+            "call_oi": float(pd.to_numeric(ce.get("oi", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()),
+            "put_oi": float(pd.to_numeric(pe.get("oi", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()),
+            "call_oi_change": float(pd.to_numeric(ce.get("oi_change", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()),
+            "put_oi_change": float(pd.to_numeric(pe.get("oi_change", pd.Series(dtype=float)), errors="coerce").fillna(0).sum()),
+        }
+    except Exception:
+        return None
+
+
+def record_option_oi_history(symbol, chain_df, max_age_seconds=3900.0):
+    """Persist only compact option OI totals; bounded to about one trading hour."""
+    rec=_tf_option_history_record(chain_df)
+    if rec is None:
+        return []
+    store=st.session_state.setdefault("trade_easy_oi_history_v2", {})
+    rows=list(store.get(symbol, []))
+    # Avoid adding identical snapshots every fragment cycle.
+    if rows:
+        last=rows[-1]
+        same=(abs(float(last.get("call_oi", 0))-rec["call_oi"]) < 0.5
+              and abs(float(last.get("put_oi", 0))-rec["put_oi"]) < 0.5
+              and abs(float(last.get("call_oi_change", 0))-rec["call_oi_change"]) < 0.5
+              and abs(float(last.get("put_oi_change", 0))-rec["put_oi_change"]) < 0.5)
+        if same and rec["ts"]-float(last.get("ts", 0)) < 60:
+            return rows
+    rows.append(rec)
+    cutoff=rec["ts"]-float(max_age_seconds)
+    rows=[r for r in rows if float(r.get("ts", 0)) >= cutoff]
+    store[symbol]=rows[-240:]
+    return store[symbol]
+
+
+def _tf_history_at_or_before(rows, seconds_back, now=None):
+    if not rows:
+        return None
+    now=float(now if now is not None else time.time())
+    target=now-float(seconds_back)
+    eligible=[r for r in rows if float(r.get("ts", 0)) <= target]
+    return eligible[-1] if eligible else None
+
+
+def option_oi_history_v2(symbol, chain_df):
+    """Return current OI and 15/30/60 minute changes where history exists."""
+    rows=record_option_oi_history(symbol, chain_df)
+    current=rows[-1] if rows else _tf_option_history_record(chain_df)
+    out={"available": bool(current), "current": current, "rows": len(rows)}
+    now=float(current["ts"]) if current else time.time()
+    for label, seconds in (("15m",900),("30m",1800),("60m",3600)):
+        base=_tf_history_at_or_before(rows, seconds, now=now)
+        if base is None or current is None:
+            out[label]={"available":False,"call_oi_change":np.nan,"put_oi_change":np.nan,
+                        "call_oi_change_pct":np.nan,"put_oi_change_pct":np.nan}
+            continue
+        c0=float(base.get("call_oi",0)); p0=float(base.get("put_oi",0))
+        cc=float(current.get("call_oi",0)); pp=float(current.get("put_oi",0))
+        out[label]={
+            "available":True,
+            "call_oi_change":cc-c0,
+            "put_oi_change":pp-p0,
+            "call_oi_change_pct":((cc-c0)/c0*100.0 if c0 else np.nan),
+            "put_oi_change_pct":((pp-p0)/p0*100.0 if p0 else np.nan),
+            "age_minutes":(now-float(base.get("ts",now)))/60.0,
+        }
+    return out
+
+
+def _tf_direction_from_result(result):
+    if not result:
+        return None
+    d=result.get("direction")
+    return d if d in ("LONG","SHORT") else None
+
+
+def _tf_evaluate_timeframe(df, timeframe, index_name, option_summary=None, live_price=None):
+    """Evaluate one completed timeframe without paper execution or broker orders."""
+    empty={"timeframe":timeframe,"available":False,"direction":None,"bias":"UNKNOWN","structure":"UNKNOWN",
+           "score":0,"ema_confirmed":False,"vwap":False,"volume":False,"sweep":False,"bos":False,"retest":False,
+           "data_ok":False,"level_status":"WAITING","clear_path":np.nan,"meaningful_move":np.nan,"reasons":[]}
+    try:
+        if df is None or df.empty or len(df)<30:
+            return empty
+        work=normalize_candles(df)
+        if work.empty or len(work)<30:
+            return empty
+        now=pd.Timestamp.now(tz="UTC")
+        interval=pd.Timedelta(minutes=int(timeframe))
+        while len(work) and work["timestamp"].iloc[-1]+interval>now:
+            work=work.iloc[:-1].reset_index(drop=True)
+        if len(work)<30:
+            return empty
+        data_ok,data_reasons=validate_candles(work,int(timeframe),max_stale_minutes=max(20,int(timeframe)*2))
+        work=add_indicators(work)
+        levels=key_levels(work)
+        pa=price_action_checks(work,levels)
+        score,direction,bias,structure,reasons,invalidations=score_signal(work,levels,pa,int(timeframe))
+        ema_state=ema_5_8_confirmation(work,direction)
+        confirmations=sum(bool(pa.get(k)) for k in ("sweep_confirmed","structure_break","retest_confirmed"))
+        px=float(live_price) if live_price is not None else float(work["close"].iloc[-1])
+        level_setup=level_setup_engine(px,direction,bias,levels,score,confirmations,option_summary,df=work,index_name=index_name)
+        return {
+            "timeframe":int(timeframe),"available":True,"direction":direction,"bias":bias,"structure":structure,
+            "score":int(score),"ema_confirmed":bool(ema_state.get("confirmed")),
+            "vwap":bool(direction=="LONG" and work["close"].iloc[-1]>work["vwap"].iloc[-1] or direction=="SHORT" and work["close"].iloc[-1]<work["vwap"].iloc[-1]),
+            "volume":bool(pd.notna(work["volume_ma"].iloc[-1]) and work["volume"].iloc[-1]>work["volume_ma"].iloc[-1]),
+            "sweep":bool(pa.get("sweep_confirmed")),"bos":bool(pa.get("structure_break")),"retest":bool(pa.get("retest_confirmed")),
+            "confirmation_count":confirmations,"data_ok":bool(data_ok),"data_reasons":data_reasons,
+            "level_status":level_setup.get("status","WAITING"),"clear_path":level_setup.get("path",{}).get("clear_path",np.nan),
+            "meaningful_move":level_setup.get("path",{}).get("meaningful_move",np.nan),
+            "ema_trend":ema_state.get("trend"),"ema_cross":ema_state.get("cross"),
+            "reasons":reasons,"invalidations":invalidations,
+            "timestamp":str(work["timestamp"].iloc[-1]),
+        }
+    except Exception as exc:
+        empty["error"]=str(exc)
+        return empty
+
+
+def _tf_best_option(chain_df, direction):
+    """Find a real broker-supplied option satisfying the requested Greek filters."""
+    result={"available":False,"reason":"NO_MATCH","type":None,"strike":np.nan,"ltp":np.nan,
+            "delta":np.nan,"theta":np.nan,"oi":np.nan,"oi_change":np.nan,"volume":np.nan}
+    if chain_df is None or chain_df.empty or direction not in ("LONG","SHORT"):
+        result["reason"]="NO_DIRECTION_OR_CHAIN"
+        return result
+    try:
+        typ="CE" if direction=="LONG" else "PE"
+        df=chain_df[chain_df["type"].eq(typ)].copy()
+        if df.empty:
+            result["reason"]="NO_DIRECTION_OPTION"
+            return result
+        for c in ("strike","ltp","delta","theta","oi","oi_change","volume"):
+            if c in df.columns:
+                df[c]=pd.to_numeric(df[c],errors="coerce")
+            else:
+                df[c]=np.nan
+        df["delta_pct"]=df["delta"].map(_tf_clean_delta)
+        # Calls need positive delta; puts need magnitude of negative delta.
+        df["delta_abs_pct"]=df["delta"].abs().map(_tf_clean_delta)
+        delta_mask=df["delta_abs_pct"]>=70.0
+        theta_mask=df["theta"].between(-10.0,-5.0,inclusive="both")
+        candidates=df[delta_mask & theta_mask].copy()
+        if candidates.empty:
+            result["reason"]="NO_GREEK_MATCH_DELTA70_THETA_5_10"
+            return result
+        # Prefer liquid contracts, then delta closest to 70 without violating the floor.
+        candidates["_liq"]=candidates["volume"].fillna(0)+candidates["oi"].fillna(0)*0.001
+        candidates["_delta_gap"]=(candidates["delta_abs_pct"]-70.0).abs()
+        candidates=candidates.sort_values(["_liq","_delta_gap"],ascending=[False,True])
+        row=candidates.iloc[0]
+        result.update({"available":True,"reason":"GREEKS_MATCH","type":typ,
+                       "strike":_tf_safe_float(row.get("strike")),"ltp":_tf_safe_float(row.get("ltp")),
+                       "delta":_tf_safe_float(row.get("delta")),"delta_pct":_tf_safe_float(row.get("delta_abs_pct")),
+                       "theta":_tf_safe_float(row.get("theta")),"oi":_tf_safe_float(row.get("oi")),
+                       "oi_change":_tf_safe_float(row.get("oi_change")),"volume":_tf_safe_float(row.get("volume"))})
+        return result
+    except Exception as exc:
+        result["reason"]="OPTION_FILTER_ERROR:"+str(exc)
+        return result
+
+
+def trade_finder_v2(timeframe_results, option_summary, option_history, chain_df, live_price, index_name):
+    """Unified Trade Finder V2: MTF + price action + OI/PCR + Greek-filtered contract."""
+    out={"status":"WAIT","direction":None,"score":0,"mtf_alignment":"0/3","option":{"available":False},
+         "oi_history":option_history or {},"reasons":[],"blocks":[],"clear_path":np.nan,"entry":np.nan,
+         "stop_loss":np.nan,"target":np.nan,"risk_reward":np.nan}
+    try:
+        usable=[timeframe_results.get(k,{}) for k in (15,30,60)]
+        dirs=[_tf_direction_from_result(x) for x in usable]
+        bull=sum(d=="LONG" for d in dirs); bear=sum(d=="SHORT" for d in dirs)
+        if bull>=2 and bull>bear:
+            direction="LONG"
+        elif bear>=2 and bear>bull:
+            direction="SHORT"
+        else:
+            direction=None
+        out["direction"]=direction
+        out["mtf_alignment"]=f"{max(bull,bear)}/3"
+        # Score is transparent and bounded; it is not a prediction probability.
+        base=0
+        if direction:
+            for r in usable:
+                if _tf_direction_from_result(r)==direction:
+                    base+=15
+                    if r.get("score",0)>=75: base+=5
+                    if r.get("ema_confirmed"): base+=4
+                    if r.get("vwap"): base+=3
+                    if r.get("volume"): base+=2
+                    if r.get("sweep"): base+=2
+                    if r.get("bos"): base+=2
+                    if r.get("retest"): base+=2
+        pcr=_tf_safe_float((option_summary or {}).get("pcr"))
+        call_chg=_tf_safe_float((option_summary or {}).get("call_oi_change"))
+        put_chg=_tf_safe_float((option_summary or {}).get("put_oi_change"))
+        if np.isfinite(pcr):
+            if direction=="LONG" and pcr>1: base+=5
+            elif direction=="SHORT" and pcr<1: base+=5
+        if direction=="LONG" and np.isfinite(put_chg) and np.isfinite(call_chg) and put_chg>call_chg: base+=5
+        if direction=="SHORT" and np.isfinite(call_chg) and np.isfinite(put_chg) and call_chg>put_chg: base+=5
+        out["score"]=int(min(100,max(0,base)))
+        contract=_tf_best_option(chain_df,direction)
+        out["option"]=contract
+        if direction is None:
+            out["blocks"].append("MTF_NOT_ALIGNED")
+        if not contract.get("available"):
+            out["blocks"].append(contract.get("reason","OPTION_NOT_FOUND"))
+        # Use the selected timeframe's latest completed price for a consistent plan.
+        primary=next((r for r in usable if r.get("available")),{})
+        if direction and primary.get("available"):
+            px=float(live_price) if live_price is not None else np.nan
+            if not np.isfinite(px):
+                # Only use a completed candle price if available from the result context.
+                px=np.nan
+            # The existing plan function uses the dataframe; this V2 layer intentionally
+            # uses the configured fixed exits to remain compatible with the paper engine.
+            if np.isfinite(px):
+                if direction=="LONG":
+                    out["entry"]=px; out["stop_loss"]=px-FIXED_STOP_LOSS_POINTS; out["target"]=px+FIXED_TARGET_POINTS
+                else:
+                    out["entry"]=px; out["stop_loss"]=px+FIXED_STOP_LOSS_POINTS; out["target"]=px-FIXED_TARGET_POINTS
+                out["risk_reward"]=FIXED_TARGET_POINTS/FIXED_STOP_LOSS_POINTS
+        # Final state is intentionally conservative: MTF 2/3 is necessary but not sufficient.
+        hard_ok=(direction is not None and contract.get("available") and out["score"]>=70)
+        if hard_ok:
+            out["status"]="CANDIDATE"
+        else:
+            out["status"]="WAIT"
+        return out
+    except Exception as exc:
+        out["status"]="WAIT"; out["blocks"]=["ENGINE_ERROR:"+str(exc)]
+        return out
+
+
+def render_trade_finder_v2(result, timeframe_results, option_history):
+    """Render a persistent, error-tolerant Trade Finder V2 panel."""
+    st.markdown('<div class="section-head">🧠 Trade Finder Engine V2</div>', unsafe_allow_html=True)
+    status=result.get("status","WAIT")
+    direction=result.get("direction") or "—"
+    status_icon={"CANDIDATE":"🟢","WAIT":"🟡","BLOCKED":"⛔"}.get(status,"🟡")
+    st.markdown(
+        f'<div class="state-box" style="padding:14px 18px;">'
+        f'<div class="state-title" style="font-size:30px;">{status_icon} {status} • {direction}</div>'
+        f'<div class="state-sub">MTF Alignment: {result.get("mtf_alignment","0/3")} • Engine Score: {int(result.get("score",0))}/100</div>'
+        f'</div>',unsafe_allow_html=True)
+    c1,c2,c3,c4,c5=st.columns(5)
+    c1.metric("15m", (timeframe_results.get(15) or {}).get("bias","—"))
+    c2.metric("30m", (timeframe_results.get(30) or {}).get("bias","—"))
+    c3.metric("60m", (timeframe_results.get(60) or {}).get("bias","—"))
+    c4.metric("MTF", result.get("mtf_alignment","0/3"))
+    c5.metric("Score", f'{int(result.get("score",0))}/100')
+    st.markdown('<div class="section-head">MTF Confirmation Matrix</div>', unsafe_allow_html=True)
+    rows=[]
+    for tf in (15,30,60):
+        r=timeframe_results.get(tf,{})
+        rows.append({"TF":f"{tf}m","Direction":r.get("direction") or "—","Bias":r.get("bias","—"),
+                     "Score":r.get("score",0),"EMA 5/8":"PASS" if r.get("ema_confirmed") else "WAIT",
+                     "VWAP":"PASS" if r.get("vwap") else "WAIT","Volume":"PASS" if r.get("volume") else "WAIT",
+                     "Sweep":"PASS" if r.get("sweep") else "WAIT","BOS":"PASS" if r.get("bos") else "WAIT",
+                     "Retest":"PASS" if r.get("retest") else "WAIT"})
+    st.dataframe(pd.DataFrame(rows),use_container_width=True,hide_index=True)
+    st.markdown('<div class="section-head">OI / PCR Intelligence</div>', unsafe_allow_html=True)
+    oh=option_history or {}
+    cur=oh.get("current") or {}
+    oi1,oi2,oi3,oi4,oi5=st.columns(5)
+    oi1.metric("CALL OI",_fmt_chain_num(cur.get("call_oi")) if cur else "—")
+    oi2.metric("PUT OI",_fmt_chain_num(cur.get("put_oi")) if cur else "—")
+    oi3.metric("CALL OI Chg",_fmt_chain_num(cur.get("call_oi_change")) if cur else "—")
+    oi4.metric("PUT OI Chg",_fmt_chain_num(cur.get("put_oi_change")) if cur else "—")
+    oi5.metric("PCR",f'{_tf_safe_float(st.session_state.get("trade_easy_v2_pcr", np.nan)):.2f}' if np.isfinite(_tf_safe_float(st.session_state.get("trade_easy_v2_pcr", np.nan))) else "—")
+    hist_rows=[]
+    for label in ("15m","30m","60m"):
+        h=oh.get(label,{})
+        hist_rows.append({"Window":label,"History":"READY" if h.get("available") else "WARMING",
+                          "CALL OI Δ":_fmt_chain_num(h.get("call_oi_change")) if h.get("available") else "—",
+                          "PUT OI Δ":_fmt_chain_num(h.get("put_oi_change")) if h.get("available") else "—",
+                          "CALL %":f'{h.get("call_oi_change_pct",np.nan):+.2f}%' if np.isfinite(_tf_safe_float(h.get("call_oi_change_pct"))) else "—",
+                          "PUT %":f'{h.get("put_oi_change_pct",np.nan):+.2f}%' if np.isfinite(_tf_safe_float(h.get("put_oi_change_pct"))) else "—"})
+    st.dataframe(pd.DataFrame(hist_rows),use_container_width=True,hide_index=True)
+    opt=result.get("option") or {}
+    st.markdown('<div class="section-head">Filtered Option Contract</div>',unsafe_allow_html=True)
+    o1,o2,o3,o4,o5,o6=st.columns(6)
+    o1.metric("Type",opt.get("type") or "—")
+    o2.metric("Strike",f'{opt.get("strike"):.0f}' if np.isfinite(_tf_safe_float(opt.get("strike"))) else "—")
+    o3.metric("LTP",f'{opt.get("ltp"):.2f}' if np.isfinite(_tf_safe_float(opt.get("ltp"))) else "—")
+    o4.metric("Delta",f'{opt.get("delta_pct"):.1f}' if np.isfinite(_tf_safe_float(opt.get("delta_pct"))) else "—")
+    o5.metric("Theta",f'{opt.get("theta"):.2f}' if np.isfinite(_tf_safe_float(opt.get("theta"))) else "—")
+    o6.metric("OI",_fmt_chain_num(opt.get("oi")) if np.isfinite(_tf_safe_float(opt.get("oi"))) else "—")
+    if not opt.get("available"):
+        st.info("कोई वास्तविक option contract अभी Delta ≥ 70% और Theta -5 से -10 की दोनों शर्तें एक साथ पूरी नहीं कर रहा है।")
+    else:
+        st.success("Greek filter PASS • Delta ≥ 70% • Theta -5 से -10")
+    p1,p2,p3,p4=st.columns(4)
+    for col,label,key in ((p1,"Entry","entry"),(p2,"Stop Loss","stop_loss"),(p3,"Target","target"),(p4,"Risk/Reward","risk_reward")):
+        val=_tf_safe_float(result.get(key))
+        col.metric(label,f'{val:.2f}' if np.isfinite(val) else "—")
+    blocks=result.get("blocks") or []
+    if blocks:
+        st.caption("V2 waiting reasons: " + " • ".join(str(x) for x in blocks[:8]))
+
 def meaningful_move_threshold(df, index_name):
     """Return an index/timeframe-specific meaningful move in points.
 
@@ -3913,6 +4264,50 @@ def dashboard(user, workspace):
             option_chain_error = None
         option_summary = summarize_option_chain(option_chain_df)
 
+        # ============================================================
+        # TRADE FINDER ENGINE V2
+        # Independent, read-only analysis layer. It never places broker orders
+        # and never mutates the existing paper execution engine.
+        # ============================================================
+        try:
+            st.session_state["trade_easy_v2_pcr"] = option_summary.get("pcr")
+            option_history_v2 = option_oi_history_v2(symbol, option_chain_df)
+            v2_history_cache = st.session_state.setdefault("trade_easy_v2_history_cache", {})
+            v2_history_at = st.session_state.setdefault("trade_easy_v2_history_at", {})
+            timeframe_results_v2 = {}
+            for tf_v2 in (15, 30, 60):
+                now_v2 = time.time()
+                cached_v2 = v2_history_cache.get(tf_v2)
+                last_v2 = float(v2_history_at.get(tf_v2, 0.0))
+                # History is cached briefly so V2 cannot hammer the broker API.
+                if cached_v2 is None or now_v2 - last_v2 >= (15.0 if strategy_market_live else 300.0):
+                    raw_v2, warn_v2 = fyers_history_snapshot(
+                        access_token, active_app_id, symbol, resolution=tf_v2, days=5,
+                        min_interval=(15.0 if strategy_market_live else 300.0),
+                    )
+                    if raw_v2 is not None and not raw_v2.empty:
+                        cached_v2 = normalize_candles(raw_v2)
+                        v2_history_cache[tf_v2] = cached_v2
+                        v2_history_at[tf_v2] = now_v2
+                    elif warn_v2 and cached_v2 is None:
+                        st.session_state.setdefault("trade_easy_v2_warnings", {})[tf_v2] = str(warn_v2)
+                timeframe_results_v2[tf_v2] = _tf_evaluate_timeframe(
+                    cached_v2, tf_v2, index_name, option_summary=option_summary, live_price=live_price
+                )
+            v2_result = trade_finder_v2(
+                timeframe_results_v2, option_summary, option_history_v2,
+                option_chain_df, live_price, index_name
+            )
+            st.session_state["trade_easy_v2_result"] = v2_result
+            st.session_state["trade_easy_v2_timeframes"] = timeframe_results_v2
+            st.session_state["trade_easy_v2_oi_history"] = option_history_v2
+            render_trade_finder_v2(v2_result, timeframe_results_v2, option_history_v2)
+        except Exception as v2_exc:
+            # V2 must never take down the main dashboard. Keep the panel visible.
+            st.session_state["trade_easy_v2_error"] = str(v2_exc)
+            st.markdown('<div class="section-head">🧠 Trade Finder Engine V2</div>', unsafe_allow_html=True)
+            st.warning(f"Trade Finder V2 अभी WAIT mode में है: {v2_exc}")
+
         if not strategy_market_live:
             st.session_state["trade_easy_closed_strategy_initialized"] = True
 
@@ -4665,7 +5060,7 @@ def _browser_password_recovery():
               }}
 
               async function updatePassword(accessToken, password) {{
-                const response = await fetch(SUPABASE_URL.replace(/\/$/, '') + '/auth/v1/user', {{
+                const response = await fetch(SUPABASE_URL.replace(/\\/$/, '') + '/auth/v1/user', {{
                   method: 'PUT',
                   headers: {{
                     'apikey': SUPABASE_KEY,
