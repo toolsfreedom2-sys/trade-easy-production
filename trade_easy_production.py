@@ -18,6 +18,7 @@ import pandas as pd
 import numpy as np
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from supabase import create_client, Client
 
 try:
@@ -4525,6 +4526,58 @@ def dashboard(user, workspace):
     _render_full_dashboard()
 
 # ============================================================
+# PASSWORD RECOVERY: DEFAULT SUPABASE EMAIL (NO CUSTOM SMTP)
+# ============================================================
+# Supabase default recovery links normally return access_token / refresh_token
+# in the browser URL fragment (#...). Streamlit's Python backend cannot read
+# URL fragments. This tiny trusted bridge copies ONLY the recovery fragment
+# values into temporary query parameters, then reloads the same app URL.
+# The server can then call supabase.auth.set_session(), show the Set New
+# Password page, and immediately clear the query parameters.
+#
+# This keeps the solution compatible with Supabase's default email template
+# and does NOT require custom SMTP.
+
+def _bridge_supabase_recovery_fragment():
+    try:
+        components.html(
+            """
+            <script>
+            (() => {
+                try {
+                    const parentWindow = window.parent;
+                    const hash = parentWindow.location.hash || '';
+                    if (!hash || !hash.includes('access_token=')) return;
+
+                    const params = new URLSearchParams(hash.substring(1));
+                    const accessToken = params.get('access_token');
+                    const refreshToken = params.get('refresh_token');
+                    const type = (params.get('type') || '').toLowerCase();
+
+                    if (!accessToken || !refreshToken || type !== 'recovery') return;
+
+                    const url = new URL(parentWindow.location.href);
+                    url.searchParams.set('reset_password', '1');
+                    url.searchParams.set('recovery_access_token', accessToken);
+                    url.searchParams.set('recovery_refresh_token', refreshToken);
+                    url.searchParams.set('recovery_type', type);
+                    url.hash = '';
+
+                    parentWindow.location.replace(url.toString());
+                } catch (e) {
+                    // Do not expose tokens or details in the UI.
+                }
+            })();
+            </script>
+            """,
+            height=0,
+            width=0,
+        )
+    except Exception:
+        pass
+
+
+# ============================================================
 # APP ROUTER
 # ============================================================
 
@@ -4532,6 +4585,12 @@ def main():
     # Restore the locally protected FYERS access token before rendering the dashboard.
     # This survives F5/Ctrl+R and Streamlit session recreation.
     _restore_fyers_session()
+
+    # Handle the URL fragment produced by Supabase's DEFAULT password-reset
+    # email. This runs before Python reads st.query_params because fragments
+    # are browser-only and are not sent to the Streamlit server.
+    _bridge_supabase_recovery_fragment()
+
     # Production credentials are loaded from Streamlit Secrets/environment.
     if FYERS_CONFIG_APP_ID:
         st.session_state.setdefault("fyers_app_id", FYERS_CONFIG_APP_ID)
@@ -4540,6 +4599,11 @@ def main():
     user = get_current_user()
 
     oauth_code = st.query_params.get("code")
+    recovery_token_hash = st.query_params.get("token_hash")
+    recovery_type = st.query_params.get("type")
+    recovery_access_token = st.query_params.get("recovery_access_token")
+    recovery_refresh_token = st.query_params.get("recovery_refresh_token")
+    recovery_fragment_type = st.query_params.get("recovery_type")
     fyers_auth_code = st.query_params.get("auth_code")
     oauth_error = st.query_params.get("error")
     oauth_error_description = st.query_params.get("error_description")
@@ -4607,39 +4671,99 @@ def main():
     # the Set New Password screen.
     reset_requested = (
         st.query_params.get("reset_password") == "1"
+        or str(recovery_type or "").lower() == "recovery"
         or bool(st.session_state.get("password_recovery"))
     )
 
-    if reset_requested and oauth_code and user is None:
+    # ------------------------------------------------------------
+    # PASSWORD RECOVERY: default Supabase fragment flow (NO SMTP)
+    # ------------------------------------------------------------
+    # The default Supabase email sends a recovery session in the URL fragment.
+    # The browser bridge above converts that fragment into temporary query
+    # parameters; now establish the authenticated Supabase session server-side.
+    if (
+        reset_requested
+        and recovery_access_token
+        and recovery_refresh_token
+        and str(recovery_fragment_type or "").lower() == "recovery"
+        and user is None
+    ):
         try:
-            response = supabase.auth.exchange_code_for_session(
-                {"auth_code": oauth_code}
+            response = supabase.auth.set_session(
+                recovery_access_token,
+                recovery_refresh_token,
             )
-
             recovered_user = getattr(response, "user", None)
-
             if recovered_user is not None:
                 user = recovered_user
                 st.session_state["password_recovery"] = True
                 clear_oauth_params()
-                st.rerun()
+            else:
+                user = get_current_user()
+                if user is not None:
+                    st.session_state["password_recovery"] = True
+                    clear_oauth_params()
 
-            user = get_current_user()
-            if user is not None:
-                st.session_state["password_recovery"] = True
-                clear_oauth_params()
-                st.rerun()
-
-            clear_oauth_params()
-            st.error(
-                "Password reset session नहीं बन सकी। "
-                "Reset link दोबारा भेजें।"
-            )
+            if user is None:
+                st.error("Password reset session नहीं बन सकी। नया reset link request करें।")
+                st.stop()
+        except Exception as e:
+            st.error(f"Password reset session verification failed: {type(e).__name__}: {e}")
             st.stop()
 
+    # ------------------------------------------------------------
+    # PASSWORD RECOVERY: token-hash flow (recommended for Streamlit)
+    # ------------------------------------------------------------
+    # Supabase's normal email confirmation can return a session in the URL
+    # fragment (#access_token=...), which a Python/Streamlit server cannot
+    # read. Our recovery email template can instead send token_hash + type
+    # to this page. verify_otp() exchanges that token for a real session.
+    if reset_requested and recovery_token_hash and user is None:
+        try:
+            response = supabase.auth.verify_otp({
+                "token_hash": recovery_token_hash,
+                "type": "recovery",
+            })
+            recovered_user = getattr(response, "user", None)
+            if recovered_user is not None:
+                user = recovered_user
+                st.session_state["password_recovery"] = True
+                clear_oauth_params()
+            else:
+                user = get_current_user()
+                if user is not None:
+                    st.session_state["password_recovery"] = True
+                    clear_oauth_params()
+
+            if user is None:
+                st.error("Password reset link invalid या expired है। नया reset link request करें।")
+                st.stop()
         except Exception as e:
-            clear_oauth_params()
-            st.error(f"Password reset callback error: {e}")
+            st.error(f"Password reset verification failed: {type(e).__name__}: {e}")
+            st.stop()
+
+    # ------------------------------------------------------------
+    # PASSWORD RECOVERY: PKCE code fallback
+    # ------------------------------------------------------------
+    if reset_requested and oauth_code and user is None:
+        try:
+            response = supabase.auth.exchange_code_for_session({"auth_code": oauth_code})
+            recovered_user = getattr(response, "user", None)
+            if recovered_user is not None:
+                user = recovered_user
+                st.session_state["password_recovery"] = True
+                clear_oauth_params()
+            else:
+                user = get_current_user()
+                if user is not None:
+                    st.session_state["password_recovery"] = True
+                    clear_oauth_params()
+
+            if user is None:
+                st.error("Password reset session नहीं बन सकी। Reset link दोबारा भेजें।")
+                st.stop()
+        except Exception as e:
+            st.error(f"Password reset callback error: {type(e).__name__}: {e}")
             st.stop()
 
     # ------------------------------------------------------------
