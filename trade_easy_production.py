@@ -4357,11 +4357,60 @@ def main():
         st.error(f"Google login failed: {oauth_error_description or oauth_error}")
         st.stop()
 
-    if oauth_code and user is None:
+    # ------------------------------------------------------------
+    # PASSWORD RECOVERY CALLBACK
+    # ------------------------------------------------------------
+    # IMPORTANT: Handle the password-reset callback BEFORE the normal
+    # Google OAuth callback. Supabase sends the reset code back to the
+    # deployed app; if the generic oauth_code block consumes it first,
+    # the user is returned to the normal Login page instead of seeing
+    # the Set New Password screen.
+    reset_requested = (
+        st.query_params.get("reset_password") == "1"
+        or bool(st.session_state.get("password_recovery"))
+    )
+
+    if reset_requested and oauth_code and user is None:
         try:
             response = supabase.auth.exchange_code_for_session(
                 {"auth_code": oauth_code}
             )
+
+            recovered_user = getattr(response, "user", None)
+
+            if recovered_user is not None:
+                user = recovered_user
+                st.session_state["password_recovery"] = True
+                clear_oauth_params()
+                st.rerun()
+
+            user = get_current_user()
+            if user is not None:
+                st.session_state["password_recovery"] = True
+                clear_oauth_params()
+                st.rerun()
+
+            clear_oauth_params()
+            st.error(
+                "Password reset session नहीं बन सकी। "
+                "Reset link दोबारा भेजें।"
+            )
+            st.stop()
+
+        except Exception as e:
+            clear_oauth_params()
+            st.error(f"Password reset callback error: {e}")
+            st.stop()
+
+    # ------------------------------------------------------------
+    # NORMAL GOOGLE OAUTH CALLBACK
+    # ------------------------------------------------------------
+    if oauth_code and user is None and not reset_requested:
+        try:
+            response = supabase.auth.exchange_code_for_session(
+                {"auth_code": oauth_code}
+            )
+
             if getattr(response, "user", None) is not None:
                 clear_oauth_params()
                 st.rerun()
@@ -4374,6 +4423,7 @@ def main():
             clear_oauth_params()
             st.error("Google login completed, but session was not found.")
             st.stop()
+
         except Exception as e:
             user_after_error = get_current_user()
             if user_after_error is not None:
@@ -4382,34 +4432,6 @@ def main():
 
             clear_oauth_params()
             st.error(f"Google login callback error: {e}")
-            st.stop()
-
-    # Password recovery flow. The reset email redirects to the deployed app
-    # with ?reset_password=1&code=... . Exchange that code into a session,
-    # then let the user set a new password using update_user().
-    reset_requested = (
-        st.query_params.get("reset_password") == "1"
-        or bool(st.session_state.get("password_recovery"))
-    )
-
-    if reset_requested and oauth_code and user is None:
-        try:
-            response = supabase.auth.exchange_code_for_session({"auth_code": oauth_code})
-            if getattr(response, "user", None) is not None:
-                st.session_state["password_recovery"] = True
-                clear_oauth_params()
-                st.rerun()
-            user = get_current_user()
-            if user is not None:
-                st.session_state["password_recovery"] = True
-                clear_oauth_params()
-                st.rerun()
-            clear_oauth_params()
-            st.error("Password reset session नहीं बन सकी। Reset link दोबारा भेजें।")
-            st.stop()
-        except Exception as e:
-            clear_oauth_params()
-            st.error(f"Password reset callback error: {e}")
             st.stop()
 
     if st.session_state.get("password_recovery"):
