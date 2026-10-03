@@ -4367,9 +4367,14 @@ def main():
     # the Set New Password screen.
     reset_requested = (
         st.query_params.get("reset_password") == "1"
+        or st.query_params.get("type") == "recovery"
         or bool(st.session_state.get("password_recovery"))
     )
 
+    # Supabase PKCE reset links return a one-time `code` to the redirect URL.
+    # IMPORTANT: do NOT call clear_oauth_params() or st.rerun() here. The
+    # recovery session must remain available in this same Streamlit run so the
+    # Set New Password form can immediately use supabase.auth.update_user().
     if reset_requested and oauth_code and user is None:
         try:
             response = supabase.auth.exchange_code_for_session(
@@ -4377,30 +4382,36 @@ def main():
             )
 
             recovered_user = getattr(response, "user", None)
-
             if recovered_user is not None:
                 user = recovered_user
                 st.session_state["password_recovery"] = True
-                clear_oauth_params()
-                st.rerun()
+            else:
+                user = get_current_user()
+                if user is not None:
+                    st.session_state["password_recovery"] = True
 
-            user = get_current_user()
-            if user is not None:
-                st.session_state["password_recovery"] = True
-                clear_oauth_params()
-                st.rerun()
+            if user is None:
+                st.error(
+                    "Password reset link की session नहीं बन सकी। "
+                    "Link expire हो सकता है या पहले ही इस्तेमाल हो चुका है।"
+                )
+                st.stop()
 
-            clear_oauth_params()
+        except Exception as e:
             st.error(
-                "Password reset session नहीं बन सकी। "
-                "Reset link दोबारा भेजें।"
+                "Password reset callback error: "
+                f"{type(e).__name__}: {e}"
             )
             st.stop()
 
-        except Exception as e:
-            clear_oauth_params()
-            st.error(f"Password reset callback error: {e}")
-            st.stop()
+    # If a recovery callback was opened without a usable authenticated session,
+    # show a recovery-specific error instead of silently sending the user to the
+    # normal Login screen.
+    if reset_requested and st.session_state.get("password_recovery") and user is None:
+        st.error(
+            "Password reset session उपलब्ध नहीं है। कृपया नया reset link request करें।"
+        )
+        st.stop()
 
     # ------------------------------------------------------------
     # NORMAL GOOGLE OAUTH CALLBACK
@@ -4436,10 +4447,10 @@ def main():
 
     if st.session_state.get("password_recovery"):
         if user is None:
-            clear_oauth_params()
-            st.session_state.pop("password_recovery", None)
-            login_page()
-            return
+            st.error(
+                "Password reset session उपलब्ध नहीं है। कृपया नया reset link request करें।"
+            )
+            st.stop()
 
         st.markdown("## 🔐 Set New Password")
         st.info("आपका password reset link सही है। नया password सेट करें।")
