@@ -4134,6 +4134,18 @@ def dashboard(user, workspace):
 
     _render_live_option_chain()
 
+    # ------------------------------------------------------------
+    # TRADE FINDER V2 — PERMANENT RENDER ROOT
+    # The V2 panel must never depend on the strategy fragment. This is critical
+    # during market-close/WAIT states where the fragment intentionally returns
+    # early. Live values are still updated from the same engine when available.
+    # ------------------------------------------------------------
+    v2_root = st.empty()
+    with v2_root.container():
+        _v2_cached_result = st.session_state.get("trade_easy_v2_result") or {}
+        _v2_cached_tfs = st.session_state.get("trade_easy_v2_timeframes") or {15:{}, 30:{}, 60:{}}
+        _v2_cached_oi = st.session_state.get("trade_easy_v2_oi_history") or {}
+        render_trade_finder_v2(_v2_cached_result, _v2_cached_tfs, _v2_cached_oi)
 
     # Permanent dashboard shell. Cards are always visible and are populated with
     # the last completed-candle / last-known strategy snapshot whenever available.
@@ -4145,12 +4157,60 @@ def dashboard(user, workspace):
     strategy_detail_root = st.empty()
     with strategy_detail_root.container():
         st.markdown('<div class="section-head">🧩 Detailed Logic / Confirmation Output</div>', unsafe_allow_html=True)
-        st.caption("यह panel हमेशा मौजूद रहेगा। Live/completed-candle logic उपलब्ध होने पर इसी जगह वास्तविक result दिखाई देगा।")
+        st.caption("यह पूरा decision layer हमेशा दिखाई देगा। Live/completed-candle data उपलब्ध होने पर values इसी स्थान पर अपडेट होंगी।")
         d1, d2, d3, d4 = st.columns(4)
         d1.metric("Logic State", "WAITING")
         d2.metric("Entry", "—")
         d3.metric("Stop Loss", "—")
         d4.metric("Target", "—")
+
+        st.markdown('<div class="section-head">🗺️ Paper Entry / Exit Map</div>', unsafe_allow_html=True)
+        p1, p2, p3, p4, p5 = st.columns(5)
+        p1.metric("Entry Price", "—")
+        p2.metric("Live Price", "—")
+        p3.metric("Stop Loss", "—")
+        p4.metric("Target", "—")
+        p5.metric("Quantity", PAPER_FIXED_QUANTITY)
+        st.caption("WAITING — validated direction/setup के बाद entry, SL और target भरेंगे।")
+
+        st.markdown('<div class="section-head">📣 Signal Output</div>', unsafe_allow_html=True)
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Direction", "—")
+        s2.metric("Signal", "WAITING")
+        s3.metric("Risk / Reward", "—")
+        s4.metric("Quantity", PAPER_FIXED_QUANTITY)
+
+        st.markdown('<div class="section-head">🔎 Mandatory Checks</div>', unsafe_allow_html=True)
+        check_shell = pd.DataFrame([
+            {"Check": "Data validation", "Status": "WAITING"},
+            {"Check": "Completed candle", "Status": "WAITING"},
+            {"Check": "Stale-data check", "Status": "WAITING"},
+            {"Check": "Risk checks", "Status": "WAITING"},
+            {"Check": "Minimum RR", "Status": "WAITING"},
+            {"Check": "5/8 EMA confirmation", "Status": "WAITING"},
+            {"Check": "Duplicate protection", "Status": "WAITING"},
+        ])
+        st.dataframe(check_shell, use_container_width=True, hide_index=True)
+
+        st.markdown('<div class="section-head">🧱 Key Levels</div>', unsafe_allow_html=True)
+        level_shell = pd.DataFrame([
+            {"Level": x, "Value": "—"}
+            for x in ["Previous Day High", "Previous Day Low", "VWAP", "Swing High", "Swing Low", "Support", "Resistance"]
+        ])
+        st.dataframe(level_shell, use_container_width=True, hide_index=True)
+
+        st.markdown('<div class="section-head">📝 Reasons / Invalidations</div>', unsafe_allow_html=True)
+        r1, r2 = st.columns(2)
+        r1.info("WAITING FOR MARKET DATA — reason codes will appear here.")
+        r2.info("WAITING FOR MARKET DATA — invalidations/blocks will appear here.")
+
+        st.markdown('<div class="section-head">🕯️ Validated Candle Data</div>', unsafe_allow_html=True)
+        candle_shell = pd.DataFrame([{
+            "Timestamp":"—", "Open":"—", "High":"—", "Low":"—", "Close":"—",
+            "Volume":"—", "VWAP":"—", "EMA 5":"—", "EMA 8":"—",
+            "RSI":"—", "MACD":"—", "ATR":"—", "ADX":"—"
+        }])
+        st.dataframe(candle_shell, use_container_width=True, hide_index=True)
 
     def _render_strategy_cards(snapshot=None):
         snap = snapshot or {}
@@ -4381,12 +4441,20 @@ def dashboard(user, workspace):
             st.session_state["trade_easy_v2_result"] = v2_result
             st.session_state["trade_easy_v2_timeframes"] = timeframe_results_v2
             st.session_state["trade_easy_v2_oi_history"] = option_history_v2
-            render_trade_finder_v2(v2_result, timeframe_results_v2, option_history_v2)
+            # Update the permanent V2 root; never let the strategy fragment own
+            # the lifetime of this panel.
+            with v2_root:
+                render_trade_finder_v2(v2_result, timeframe_results_v2, option_history_v2)
         except Exception as v2_exc:
             # V2 must never take down the main dashboard. Keep the panel visible.
             st.session_state["trade_easy_v2_error"] = str(v2_exc)
-            st.markdown('<div class="section-head">🧠 Trade Finder Engine V2</div>', unsafe_allow_html=True)
-            st.warning(f"Trade Finder V2 अभी WAIT mode में है: {v2_exc}")
+            with v2_root:
+                render_trade_finder_v2(
+                    st.session_state.get("trade_easy_v2_result") or {},
+                    st.session_state.get("trade_easy_v2_timeframes") or {15:{}, 30:{}, 60:{}},
+                    st.session_state.get("trade_easy_v2_oi_history") or {},
+                )
+                st.warning(f"Trade Finder V2 अभी WAIT mode में है: {v2_exc}")
 
         if not strategy_market_live:
             st.session_state["trade_easy_closed_strategy_initialized"] = True
