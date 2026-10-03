@@ -19,6 +19,7 @@ import numpy as np
 import requests
 import streamlit as st
 from supabase import create_client, Client
+from supabase.lib.client_options import ClientOptions
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -1329,50 +1330,61 @@ def admin_load_all():
     return profiles, plans, subscriptions, payments
 
 
-def admin_reset_user_password(user_id, new_password):
-    """Reset any user's Supabase Auth password from the server side.
+@st.cache_resource
+def get_supabase_admin() -> Client:
+    """Create a stateless, server-only Supabase Admin client.
 
-    This uses the Supabase Auth Admin REST endpoint and therefore requires
-    SUPABASE_SECRET_KEY in Streamlit Secrets. The secret is never rendered
-    in the app. Only an authenticated admin can reach the UI that calls this.
+    Auth Admin methods must run on a trusted server with the project's
+    secret key. Disabling session persistence/auto-refresh prevents the
+    normal user-auth client from replacing the Admin Authorization header.
     """
+    if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
+        raise RuntimeError("Supabase Admin configuration is missing.")
+    return create_client(
+        SUPABASE_URL,
+        SUPABASE_SECRET_KEY,
+        options=ClientOptions(
+            auto_refresh_token=False,
+            persist_session=False,
+        ),
+    )
+
+
+def admin_reset_user_password(user_id, new_password):
+    """Reset any user's Supabase Auth password from the trusted server."""
     if not SUPABASE_SECRET_KEY:
         return False, "SUPABASE_SECRET_KEY Streamlit Secrets में configured नहीं है।"
     if not user_id:
         return False, "User ID missing है।"
     if not new_password or len(new_password) < 8:
         return False, "Password कम-से-कम 8 characters का होना चाहिए।"
+
     try:
-        endpoint = f"{SUPABASE_URL.rstrip('/')}/auth/v1/admin/users/{user_id}"
-        response = requests.put(
-            endpoint,
-            headers={
-                "apikey": SUPABASE_SECRET_KEY,
-                "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={"password": new_password},
-            timeout=15,
+        admin_client = get_supabase_admin()
+        response = admin_client.auth.admin.update_user_by_id(
+            str(user_id),
+            {"password": str(new_password)},
         )
-        if 200 <= response.status_code < 300:
+        updated_user = getattr(response, "user", None)
+        if updated_user is not None:
             return True, None
-        try:
-            detail = response.json()
-        except Exception:
-            detail = response.text
-        return False, f"Supabase password update failed ({response.status_code}): {detail}"
+
+        # Some supabase-py versions expose the response as a dict-like object.
+        if isinstance(response, dict) and response.get("user"):
+            return True, None
+
+        return False, "Supabase Auth ने password update का user response नहीं लौटाया।"
     except Exception as exc:
-        return False, f"Password update error: {exc}"
+        detail = str(exc)
+        return False, f"Supabase Auth Admin password update failed: {detail}"
 
 
 def admin_bootstrap_admin_password(email, bootstrap_token, new_password):
-    """Pre-login first-admin password bootstrap using a server-only Supabase key.
+    """Pre-login first-admin password bootstrap using Supabase Auth Admin SDK.
 
-    IMPORTANT: Supabase's new sb_secret_* keys are API keys, not JWTs.
-    Therefore they must be sent in the `apikey` header and NOT as
-    `Authorization: Bearer ...`. The previous V3 implementation used the
-    Python auth.admin client, which can send the key as a bearer credential
-    and causes: "This endpoint requires a valid Bearer token".
+    This runs only on the Streamlit server. The configured bootstrap token
+    gates the operation, while the Supabase secret key authorizes the
+    server-side Auth Admin call.
     """
     email = str(email or "").strip().lower()
     bootstrap_token = str(bootstrap_token or "")
@@ -1382,63 +1394,57 @@ def admin_bootstrap_admin_password(email, bootstrap_token, new_password):
         return False, "SUPABASE_SECRET_KEY Streamlit Secrets में configured नहीं है।"
     if not TRADE_EASY_ADMIN_BOOTSTRAP_TOKEN:
         return False, "TRADE_EASY_ADMIN_BOOTSTRAP_TOKEN Streamlit Secrets में configured नहीं है।"
-    if not email or not hmac.compare_digest(email, TRADE_EASY_ADMIN_EMAIL.strip().lower()):
+    if not email or not hmac.compare_digest(
+        email, TRADE_EASY_ADMIN_EMAIL.strip().lower()
+    ):
         return False, "यह email configured first-admin email नहीं है।"
-    if not hmac.compare_digest(bootstrap_token, TRADE_EASY_ADMIN_BOOTSTRAP_TOKEN):
+    if not hmac.compare_digest(
+        bootstrap_token, TRADE_EASY_ADMIN_BOOTSTRAP_TOKEN
+    ):
         return False, "Admin bootstrap token गलत है।"
     if len(new_password) < 8:
         return False, "Password कम-से-कम 8 characters का होना चाहिए।"
 
     try:
-        # New Supabase sb_secret_* keys are opaque API keys, not JWTs.
-        # Send them only through `apikey`; do NOT send Authorization: Bearer.
-        api_headers = {
-            "apikey": SUPABASE_SECRET_KEY,
-            "Content-Type": "application/json",
-        }
+        admin_client = get_supabase_admin()
 
-        # 1) Find the existing Auth user by email through Auth Admin REST.
-        users_url = (
-            f"{SUPABASE_URL.rstrip('/')}/auth/v1/admin/users"
-            "?page=1&per_page=1000"
+        # Find the Auth user using the official server-side Admin API.
+        users_response = admin_client.auth.admin.list_users(
+            page=1,
+            per_page=1000,
         )
-        users_response = requests.get(users_url, headers=api_headers, timeout=15)
-        if users_response.status_code >= 300:
-            try:
-                detail = users_response.json()
-            except Exception:
-                detail = users_response.text
-            return False, (
-                f"Supabase Auth Admin API access failed ({users_response.status_code}). "
-                f"Check that SUPABASE_SECRET_KEY is the current project's secret key. Detail: {detail}"
-            )
+        users = getattr(users_response, "users", None)
+        if users is None and isinstance(users_response, dict):
+            users = users_response.get("users")
+        users = users or []
 
-        payload = users_response.json()
-        users = payload.get("users", []) if isinstance(payload, dict) else []
-        auth_user = next(
-            (
-                u for u in users
-                if str((u or {}).get("email") or "").strip().lower() == email
-            ),
-            None,
-        )
-        if not auth_user:
+        auth_user = None
+        for candidate in users:
+            candidate_email = str(
+                getattr(candidate, "email", None) or ""
+            ).strip().lower()
+            if not candidate_email and isinstance(candidate, dict):
+                candidate_email = str(
+                    candidate.get("email") or ""
+                ).strip().lower()
+
+            if candidate_email == email:
+                auth_user = candidate
+                break
+
+        if auth_user is None:
             return False, (
                 f"Supabase Auth में {email} नहीं मिला। "
-                "Streamlit Secrets का SUPABASE_URL वर्तमान Trade Easy Production project से match करें।"
+                "SUPABASE_URL और Streamlit Secret की project matching जाँचें।"
             )
 
-        user_id = str(auth_user.get("id") or "").strip()
+        user_id = str(getattr(auth_user, "id", None) or "").strip()
+        if not user_id and isinstance(auth_user, dict):
+            user_id = str(auth_user.get("id") or "").strip()
         if not user_id:
             return False, "Supabase Auth user ID नहीं मिला।"
 
-        # 2) Ensure public.profiles has the required admin state.
-        profile_url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/profiles"
-        profile_headers = {
-            "apikey": SUPABASE_SECRET_KEY,
-            "Content-Type": "application/json",
-            "Prefer": "resolution=merge-duplicates,return=representation",
-        }
+        # Keep the application's admin profile synchronized.
         profile_payload = {
             "id": user_id,
             "email": email,
@@ -1446,39 +1452,36 @@ def admin_bootstrap_admin_password(email, bootstrap_token, new_password):
             "status": "active",
             "updated_at": _utc_now().isoformat(),
         }
-        profile_response = requests.post(
-            profile_url,
-            headers=profile_headers,
-            params={"on_conflict": "id"},
-            json=profile_payload,
-            timeout=15,
+        profile_result = (
+            admin_client.table("profiles")
+            .upsert(profile_payload, on_conflict="id")
+            .execute()
         )
-        if profile_response.status_code >= 300:
-            try:
-                detail = profile_response.json()
-            except Exception:
-                detail = profile_response.text
-            return False, f"Admin profile create/update failed ({profile_response.status_code}): {detail}"
+        if not profile_result.data:
+            return False, (
+                "Admin profile create/update नहीं हो सका। "
+                "Supabase profiles schema check करें।"
+            )
 
-        # 3) Set the Auth password through the Auth Admin REST endpoint.
-        update_url = f"{SUPABASE_URL.rstrip('/')}/auth/v1/admin/users/{user_id}"
-        update_response = requests.put(
-            update_url,
-            headers=api_headers,
-            json={"password": new_password, "email_confirm": True},
-            timeout=15,
+        # Official Supabase Auth Admin password update.
+        response = admin_client.auth.admin.update_user_by_id(
+            user_id,
+            {
+                "password": new_password,
+                "email_confirm": True,
+            },
         )
-        if update_response.status_code >= 300:
-            try:
-                detail = update_response.json()
-            except Exception:
-                detail = update_response.text
-            return False, f"Supabase password update failed ({update_response.status_code}): {detail}"
+        updated_user = getattr(response, "user", None)
+        if updated_user is None and not (
+            isinstance(response, dict) and response.get("user")
+        ):
+            return False, "Supabase Auth ने password update confirm नहीं किया।"
 
         return True, None
 
     except Exception as exc:
-        return False, f"Admin bootstrap error: {exc}"
+        detail = str(exc)
+        return False, f"Admin bootstrap error: {detail}"
 
 
 def admin_update_profile(user_id, *, role=None, status=None):
