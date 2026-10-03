@@ -2065,120 +2065,151 @@ with check (public.trade_easy_is_admin());
 
 
 def login_page():
+    """Compact, centered popup-style authentication screen."""
     st.markdown("""
     <style>
+    /* Keep the authentication experience compact instead of using the whole page. */
     .stApp {
         background:
-            radial-gradient(circle at 10% 10%, rgba(54,105,255,.25), transparent 28%),
-            radial-gradient(circle at 90% 10%, rgba(175,80,255,.20), transparent 30%),
-            linear-gradient(135deg,#071426,#101b35,#080d1b);
+            radial-gradient(circle at 15% 20%, rgba(38,99,235,.22), transparent 30%),
+            radial-gradient(circle at 85% 18%, rgba(139,92,246,.18), transparent 28%),
+            linear-gradient(135deg,#050b16 0%,#0a1222 48%,#060b14 100%);
+    }
+    [data-testid="stHeader"] { background: transparent; }
+    [data-testid="stToolbar"] { display:none; }
+    .auth-shell {
+        min-height: 82vh;
+        display:flex;
+        align-items:center;
+        justify-content:center;
+        padding:28px 12px;
     }
     .auth-card {
-        max-width: 560px;
-        margin: 70px auto 20px auto;
-        padding: 34px;
-        border-radius: 24px;
-        background: rgba(255,255,255,.07);
-        border: 1px solid rgba(255,255,255,.12);
-        box-shadow: 0 20px 60px rgba(0,0,0,.30);
+        width:100%;
+        max-width:430px;
+        padding:26px 28px 24px;
+        border-radius:22px;
+        background:rgba(12,20,35,.88);
+        border:1px solid rgba(148,163,184,.20);
+        box-shadow:0 24px 80px rgba(0,0,0,.48), inset 0 1px 0 rgba(255,255,255,.05);
+        backdrop-filter:blur(18px);
     }
-    .auth-title { color:#fff; font-size:36px; font-weight:900; }
-    .auth-sub { color:#aebbd2; margin-bottom:25px; }
+    .auth-brand { text-align:center; margin-bottom:18px; }
+    .auth-logo {
+        width:52px;height:52px;margin:0 auto 10px;border-radius:16px;
+        display:flex;align-items:center;justify-content:center;
+        font-size:25px;font-weight:900;
+        background:linear-gradient(135deg,#2563eb,#7c3aed);
+        color:#fff;box-shadow:0 10px 30px rgba(37,99,235,.28);
+    }
+    .auth-title { color:#f8fafc;font-size:25px;font-weight:850;letter-spacing:-.4px; }
+    .auth-sub { color:#94a3b8;font-size:12px;margin-top:4px; }
+    .auth-caption { color:#64748b;font-size:11px;text-align:center;margin-top:15px; }
+    div[data-testid="stTabs"] button { font-size:13px; font-weight:700; }
+    div[data-testid="stTextInput"] input {
+        border-radius:10px !important;
+        background:rgba(15,23,42,.72) !important;
+    }
+    div.stButton > button {
+        border-radius:10px !important;
+        min-height:40px !important;
+        font-weight:700 !important;
+    }
     </style>
+    <div class="auth-shell">
+      <div class="auth-card">
+        <div class="auth-brand">
+          <div class="auth-logo">TE</div>
+          <div class="auth-title">Trade Easy</div>
+          <div class="auth-sub">Index Trading Confirmation &amp; Risk Control</div>
+        </div>
+      </div>
+    </div>
     """, unsafe_allow_html=True)
 
-    st.markdown(
-        '<div class="auth-card">'
-        '<div class="auth-title">Trade Easy Trading</div>'
-        '<div class="auth-sub">Index Trading Confirmation & Risk Control</div>'
-        '</div>',
-        unsafe_allow_html=True,
-    )
+    # Streamlit widgets remain in the centered page column so the actual form
+    # stays compact and aligned with the popup card above.
+    left, center, right = st.columns([1.15, 1.7, 1.15])
+    with center:
+        login_tab, signup_tab = st.tabs(["🔐 Login", "🆕 Create Account"])
 
-    login_tab, signup_tab = st.tabs(["🔐 Login", "🆕 Create Account"])
+        with login_tab:
+            email = st.text_input("Email", key="login_email", placeholder="you@example.com")
+            password = st.text_input("Password", type="password", key="login_password", placeholder="Enter your password")
 
-    with login_tab:
-        email = st.text_input("Email", key="login_email")
-        password = st.text_input("Password", type="password", key="login_password")
-
-        if st.button("Login", use_container_width=True, type="primary"):
-            try:
-                result = supabase.auth.sign_in_with_password(
-                    {"email": email.strip(), "password": password}
-                )
-                if getattr(result, "user", None):
-                    st.success("Login successful")
-                    st.rerun()
-                else:
-                    st.error("Login failed.")
-            except Exception as e:
-                st.error(f"Login error: {e}")
-
-        forgot_col, _ = st.columns([1, 3])
-        with forgot_col:
-            if st.button("Forgot Password?", use_container_width=True, key="forgot_password_btn"):
-                if not email.strip():
-                    st.warning("पहले अपना email address डालें।")
-                else:
-                    try:
-                        password_reset_url = f"{TRADE_EASY_PUBLIC_URL.rstrip('/')}/?reset_password=1"
-                        supabase.auth.reset_password_for_email(
-                            email.strip(),
-                            {"redirect_to": password_reset_url},
-                        )
-                        st.success(
-                            "Password reset link भेज दिया गया है। Email खोलें और उसी Trade Easy page पर नया password सेट करें।"
-                        )
-                    except Exception as e:
-                        st.error(f"Password reset error: {e}")
-
-        if st.button("Continue with Google", use_container_width=True):
-            try:
-                response = supabase.auth.sign_in_with_oauth(
-                    {
-                        "provider": "google",
-                        "options": {"redirect_to": REDIRECT_URL},
-                    }
-                )
-                url = getattr(response, "url", None)
-                if url:
-                    st.markdown(
-                        f'<meta http-equiv="refresh" content="0; url={url}">',
-                        unsafe_allow_html=True,
+            if st.button("Login", use_container_width=True, type="primary", key="login_btn"):
+                try:
+                    result = supabase.auth.sign_in_with_password(
+                        {"email": email.strip(), "password": password}
                     )
-                    st.info("Google Login खोल रहा है...")
-                else:
-                    st.error("Google OAuth URL नहीं मिला।")
-            except Exception as e:
-                st.error(f"Google login error: {e}")
+                    if getattr(result, "user", None):
+                        st.success("Login successful")
+                        st.rerun()
+                    else:
+                        st.error("Login failed.")
+                except Exception as e:
+                    st.error(f"Login error: {e}")
 
-    with signup_tab:
-        name = st.text_input("Name", key="signup_name")
-        email = st.text_input("Email", key="signup_email")
-        password = st.text_input("Password", type="password", key="signup_password")
+            forgot_col, spacer = st.columns([1.25, 1])
+            with forgot_col:
+                if st.button("Forgot Password?", use_container_width=True, key="forgot_password_btn"):
+                    if not email.strip():
+                        st.warning("पहले अपना email address डालें।")
+                    else:
+                        try:
+                            password_reset_url = f"{TRADE_EASY_PUBLIC_URL.rstrip('/')}/?reset_password=1"
+                            supabase.auth.reset_password_for_email(
+                                email.strip(),
+                                {"redirect_to": password_reset_url},
+                            )
+                            st.success("Password reset link भेज दिया गया है। Email खोलें और नया password सेट करें।")
+                        except Exception as e:
+                            st.error(f"Password reset error: {e}")
 
-        if st.button("Create Account", use_container_width=True, type="primary"):
-            try:
-                result = supabase.auth.sign_up(
-                    {
-                        "email": email.strip(),
-                        "password": password,
-                        "options": {
-                            "data": {
-                                "display_name": name.strip(),
-                                "full_name": name.strip(),
-                            }
-                        },
-                    }
-                )
-                if getattr(result, "user", None):
-                    st.success(
-                        "Account created. अगर email confirmation enabled है तो पहले email confirm करें।"
+            if st.button("Continue with Google", use_container_width=True, key="google_login_btn"):
+                try:
+                    response = supabase.auth.sign_in_with_oauth(
+                        {"provider": "google", "options": {"redirect_to": REDIRECT_URL}}
                     )
-                else:
-                    st.error("Account creation failed.")
-            except Exception as e:
-                st.error(f"Signup error: {e}")
+                    url = getattr(response, "url", None)
+                    if url:
+                        st.markdown(
+                            f'<meta http-equiv="refresh" content="0; url={url}">',
+                            unsafe_allow_html=True,
+                        )
+                        st.info("Google Login खोल रहा है...")
+                    else:
+                        st.error("Google OAuth URL नहीं मिला।")
+                except Exception as e:
+                    st.error(f"Google login error: {e}")
+
+        with signup_tab:
+            name = st.text_input("Name", key="signup_name", placeholder="Your name")
+            email = st.text_input("Email", key="signup_email", placeholder="you@example.com")
+            password = st.text_input("Password", type="password", key="signup_password", placeholder="Create a password")
+
+            if st.button("Create Account", use_container_width=True, type="primary", key="signup_btn"):
+                try:
+                    result = supabase.auth.sign_up(
+                        {
+                            "email": email.strip(),
+                            "password": password,
+                            "options": {
+                                "data": {
+                                    "display_name": name.strip(),
+                                    "full_name": name.strip(),
+                                }
+                            },
+                        }
+                    )
+                    if getattr(result, "user", None):
+                        st.success("Account created. अगर email confirmation enabled है तो पहले email confirm करें।")
+                    else:
+                        st.error("Account creation failed.")
+                except Exception as e:
+                    st.error(f"Signup error: {e}")
+
+        st.markdown('<div class="auth-caption">Secure authentication • Trade Easy</div>', unsafe_allow_html=True)
 
 
 # ============================================================
