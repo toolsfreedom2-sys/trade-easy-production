@@ -19,7 +19,6 @@ import numpy as np
 import requests
 import streamlit as st
 from supabase import create_client, Client
-from supabase.lib.client_options import ClientOptions
 
 try:
     from streamlit_autorefresh import st_autorefresh
@@ -1340,14 +1339,13 @@ def get_supabase_admin() -> Client:
     """
     if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
         raise RuntimeError("Supabase Admin configuration is missing.")
-    return create_client(
-        SUPABASE_URL,
-        SUPABASE_SECRET_KEY,
-        options=ClientOptions(
-            auto_refresh_token=False,
-            persist_session=False,
-        ),
-    )
+    # Keep this Admin client completely separate from the normal user client.
+    # We intentionally do not pass ClientOptions here because deployed
+    # supabase-py installations can have incompatible ClientOptions models
+    # (which can raise: 'ClientOptions' object has no attribute 'storage').
+    # A dedicated client instance already prevents the normal user's session
+    # from being mixed into the Admin client.
+    return create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
 
 
 def admin_reset_user_password(user_id, new_password):
