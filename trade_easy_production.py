@@ -4539,107 +4539,133 @@ def dashboard(user, workspace):
 # redirects back to the clean Trade Easy login URL.
 
 def _browser_password_recovery():
+    """Handle Supabase's default password-reset URL entirely in the browser.
+
+    Supabase's default/implicit recovery flow returns access_token and
+    refresh_token in the URL fragment (#...). The browser receives that
+    fragment; Streamlit's Python backend does not. Using st.html with
+    unsafe_allow_javascript=True keeps the token in the browser and avoids
+    the iframe limitation of components.html.
+
+    No custom SMTP is required.
+    """
     try:
-        components.html(
+        st.html(
             f"""
-            <div id="trade-easy-recovery-root" style="display:none;position:fixed;inset:0;z-index:2147483647;background:#08111f;color:#fff;font-family:Arial,sans-serif;padding:30px;box-sizing:border-box;overflow:auto;">
-              <div style="max-width:520px;margin:60px auto;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15);border-radius:20px;padding:28px;box-shadow:0 20px 70px rgba(0,0,0,.45);">
-                <h2 style="margin:0 0 8px;">🔐 Set New Password</h2>
-                <p id="trade-easy-recovery-msg" style="color:#b8c5d9;">Password reset session verify हो रही है...</p>
-                <div id="trade-easy-recovery-form" style="display:none;">
-                  <label style="display:block;margin:14px 0 6px;">New Password</label>
-                  <input id="trade-easy-new-password" type="password" autocomplete="new-password" style="width:100%;padding:12px;border-radius:10px;border:1px solid #44546b;background:#101b2d;color:#fff;box-sizing:border-box;">
-                  <label style="display:block;margin:14px 0 6px;">Confirm New Password</label>
-                  <input id="trade-easy-confirm-password" type="password" autocomplete="new-password" style="width:100%;padding:12px;border-radius:10px;border:1px solid #44546b;background:#101b2d;color:#fff;box-sizing:border-box;">
-                  <button id="trade-easy-update-password" style="margin-top:20px;width:100%;padding:13px;border:0;border-radius:10px;background:#2563eb;color:#fff;font-size:16px;font-weight:700;cursor:pointer;">Update Password</button>
+            <div id="te-recovery-overlay" style="display:none;position:fixed;inset:0;z-index:2147483647;background:#08111f;color:#fff;font-family:Arial,sans-serif;padding:24px;box-sizing:border-box;overflow:auto;">
+              <div style="max-width:520px;margin:70px auto;background:#111c2e;border:1px solid rgba(255,255,255,.15);border-radius:20px;padding:30px;box-shadow:0 20px 70px rgba(0,0,0,.45);">
+                <h2 style="margin:0 0 8px;font-size:28px;">🔐 Set New Password</h2>
+                <p id="te-recovery-msg" style="color:#b8c5d9;line-height:1.5;">Password reset link verify हो रही है...</p>
+                <div id="te-recovery-form" style="display:none;">
+                  <label style="display:block;margin:16px 0 7px;">New Password</label>
+                  <input id="te-new-password" type="password" autocomplete="new-password" style="width:100%;padding:13px;border-radius:10px;border:1px solid #44546b;background:#0b1422;color:#fff;box-sizing:border-box;font-size:16px;">
+                  <label style="display:block;margin:16px 0 7px;">Confirm New Password</label>
+                  <input id="te-confirm-password" type="password" autocomplete="new-password" style="width:100%;padding:13px;border-radius:10px;border:1px solid #44546b;background:#0b1422;color:#fff;box-sizing:border-box;font-size:16px;">
+                  <button id="te-update-password" style="margin-top:22px;width:100%;padding:14px;border:0;border-radius:10px;background:#2563eb;color:#fff;font-size:16px;font-weight:700;cursor:pointer;">Update Password</button>
                 </div>
               </div>
             </div>
-            <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
             <script>
             (() => {{
-              const root = document.getElementById('trade-easy-recovery-root');
-              const msg = document.getElementById('trade-easy-recovery-msg');
-              const form = document.getElementById('trade-easy-recovery-form');
-              const btn = document.getElementById('trade-easy-update-password');
-              const newPw = document.getElementById('trade-easy-new-password');
-              const confirmPw = document.getElementById('trade-easy-confirm-password');
+              const overlay = document.getElementById('te-recovery-overlay');
+              const msg = document.getElementById('te-recovery-msg');
+              const form = document.getElementById('te-recovery-form');
+              const btn = document.getElementById('te-update-password');
+              const pw1 = document.getElementById('te-new-password');
+              const pw2 = document.getElementById('te-confirm-password');
+              if (!overlay || !msg || !form || !btn) return;
 
-              function cleanAppUrl() {{
-                const u = new URL(window.top.location.href);
-                u.hash = '';
-                u.searchParams.delete('reset_password');
-                u.searchParams.delete('recovery_access_token');
-                u.searchParams.delete('recovery_refresh_token');
-                u.searchParams.delete('recovery_type');
-                u.searchParams.set('password_reset_success', '1');
-                return u.toString();
+              const SUPABASE_URL = {SUPABASE_URL!r};
+              const SUPABASE_KEY = {SUPABASE_PUBLISHABLE_KEY!r};
+
+              function parseRecoveryFragment() {{
+                const hash = window.location.hash || '';
+                if (!hash || !hash.includes('access_token=')) return null;
+                const params = new URLSearchParams(hash.replace(/^#/, ''));
+                const type = (params.get('type') || '').toLowerCase();
+                const accessToken = params.get('access_token');
+                const refreshToken = params.get('refresh_token');
+                if (type !== 'recovery' || !accessToken) return null;
+                return {{ accessToken, refreshToken, type }};
               }}
 
-              async function run() {{
+              function cleanAndReload() {{
                 try {{
-                  const topUrl = new URL(window.top.location.href);
-                  const hash = topUrl.hash || '';
-                  if (!hash || !hash.includes('access_token=')) return;
-
-                  const params = new URLSearchParams(hash.substring(1));
-                  const accessToken = params.get('access_token');
-                  const refreshToken = params.get('refresh_token');
-                  const type = (params.get('type') || '').toLowerCase();
-                  if (!accessToken || !refreshToken || type !== 'recovery') return;
-
-                  root.style.display = 'block';
-                  try {{ if (window.frameElement) window.frameElement.style.height = '560px'; }} catch (_) {{}}
-                  const sb = window.supabase.createClient(
-                    {SUPABASE_URL!r},
-                    {SUPABASE_PUBLISHABLE_KEY!r},
-                    {{ auth: {{ persistSession: false, autoRefreshToken: true, detectSessionInUrl: false }} }}
-                  );
-
-                  const result = await sb.auth.setSession({{
-                    access_token: accessToken,
-                    refresh_token: refreshToken
-                  }});
-                  if (result.error) throw result.error;
-                  if (!result.data || !result.data.user) throw new Error('Recovery user session नहीं मिली।');
-
-                  msg.textContent = 'Recovery verified. नया password नीचे सेट करें।';
-                  form.style.display = 'block';
-
-                  btn.onclick = async () => {{
-                    const a = newPw.value || '';
-                    const b = confirmPw.value || '';
-                    if (a.length < 8) {{ msg.textContent = 'Password कम-से-कम 8 characters का होना चाहिए।'; return; }}
-                    if (a !== b) {{ msg.textContent = 'दोनों passwords match नहीं कर रहे हैं।'; return; }}
-                    btn.disabled = true;
-                    btn.textContent = 'Updating...';
-                    try {{
-                      const updated = await sb.auth.updateUser({{ password: a }});
-                      if (updated.error) throw updated.error;
-                      msg.textContent = '✅ Password successfully updated. Login page खुल रहा है...';
-                      await sb.auth.signOut();
-                      setTimeout(() => {{ window.top.location.replace(cleanAppUrl()); }}, 700);
-                    }} catch (e) {{
-                      msg.textContent = 'Password update failed: ' + (e && e.message ? e.message : 'Unknown error');
-                      btn.disabled = false;
-                      btn.textContent = 'Update Password';
-                    }}
-                  }};
-                }} catch (e) {{
-                  root.style.display = 'block';
-                  try {{ if (window.frameElement) window.frameElement.style.height = '560px'; }} catch (_) {{}}
-                  msg.textContent = 'Password reset link verify नहीं हो सका: ' + (e && e.message ? e.message : 'Unknown error');
+                  const u = new URL(window.location.href);
+                  u.hash = '';
+                  u.searchParams.delete('reset_password');
+                  u.searchParams.delete('recovery_access_token');
+                  u.searchParams.delete('recovery_refresh_token');
+                  u.searchParams.delete('recovery_type');
+                  u.searchParams.delete('password_reset_success');
+                  window.location.replace(u.toString());
+                }} catch (_) {{
+                  window.location.reload();
                 }}
               }}
-              run();
+
+              async function updatePassword(accessToken, password) {{
+                const response = await fetch(SUPABASE_URL.replace(/\/$/, '') + '/auth/v1/user', {{
+                  method: 'PUT',
+                  headers: {{
+                    'apikey': SUPABASE_KEY,
+                    'Authorization': 'Bearer ' + accessToken,
+                    'Content-Type': 'application/json'
+                  }},
+                  body: JSON.stringify({{ password }})
+                }});
+                let body = null;
+                try {{ body = await response.json(); }} catch (_) {{}}
+                if (!response.ok) {{
+                  const detail = body && (body.msg || body.message || body.error_description || body.error) ? (body.msg || body.message || body.error_description || body.error) : ('HTTP ' + response.status);
+                  throw new Error(detail);
+                }}
+                return body;
+              }}
+
+              async function runRecovery() {{
+                const recovery = parseRecoveryFragment();
+                if (!recovery) return;
+
+                overlay.style.display = 'block';
+                msg.textContent = 'Recovery link verified. नया password सेट करें।';
+                form.style.display = 'block';
+                try {{ if (document.body) document.body.style.overflow = 'hidden'; }} catch (_) {{}}
+
+                btn.onclick = async () => {{
+                  const a = pw1.value || '';
+                  const b = pw2.value || '';
+                  if (a.length < 8) {{ msg.textContent = 'Password कम-से-कम 8 characters का होना चाहिए।'; return; }}
+                  if (a !== b) {{ msg.textContent = 'दोनों passwords match नहीं कर रहे हैं।'; return; }}
+
+                  btn.disabled = true;
+                  btn.textContent = 'Updating...';
+                  try {{
+                    await updatePassword(recovery.accessToken, a);
+                    msg.textContent = '✅ Password successfully updated. Login page खुल रहा है...';
+                    setTimeout(cleanAndReload, 900);
+                  }} catch (e) {{
+                    msg.textContent = 'Password update failed: ' + (e && e.message ? e.message : 'Unknown error');
+                    btn.disabled = false;
+                    btn.textContent = 'Update Password';
+                  }}
+                }};
+              }}
+
+              runRecovery().catch(e => {{
+                overlay.style.display = 'block';
+                msg.textContent = 'Password reset link verify नहीं हो सका: ' + (e && e.message ? e.message : 'Unknown error');
+              }});
             }})();
             </script>
             """,
-            height=1,
-            width=0,
+            unsafe_allow_javascript=True,
+            width="stretch",
         )
-    except Exception:
-        pass
+    except Exception as exc:
+        # Do not break the normal login/dashboard if the optional recovery UI
+        # cannot render on an older Streamlit runtime.
+        st.session_state["trade_easy_recovery_ui_error"] = str(exc)
 
 
 # ============================================================
