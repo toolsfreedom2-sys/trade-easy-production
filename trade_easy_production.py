@@ -1023,10 +1023,18 @@ def trade_finder_v2(timeframe_results, option_summary, option_history, chain_df,
         return out
 
 
-def render_trade_finder_v2(result, timeframe_results, option_history):
-    """Render a persistent, error-tolerant Trade Finder V2 panel."""
+def render_trade_finder_v2(result=None, timeframe_results=None, option_history=None):
+    """Render a persistent V2 panel even when live data is unavailable.
+
+    The panel is a permanent UI shell. Live values are filled only when the
+    required market snapshot is available; otherwise the cards remain visible
+    with WAITING / — states.
+    """
+    result = result or {}
+    timeframe_results = timeframe_results or {}
+    option_history = option_history or {}
     st.markdown('<div class="section-head">🧠 Trade Finder Engine V2</div>', unsafe_allow_html=True)
-    status=result.get("status","WAIT")
+    status=result.get("status","WAITING FOR LIVE DATA")
     direction=result.get("direction") or "—"
     status_icon={"CANDIDATE":"🟢","WAIT":"🟡","BLOCKED":"⛔"}.get(status,"🟡")
     st.markdown(
@@ -3529,6 +3537,58 @@ def make_demo_data():
 # DASHBOARD
 # ============================================================
 
+def render_permanent_dashboard_shell():
+    """Render every major dashboard box even without live market data.
+
+    This is intentionally UI-only. It never fabricates market values. Each box
+    stays visible and shows WAITING / — until the corresponding live or cached
+    dataset becomes available.
+    """
+    st.markdown('<div class="section-head">📦 Dashboard — All Panels</div>', unsafe_allow_html=True)
+    st.caption("सभी panels हमेशा दिखाई देंगे। Live-only values केवल market/live data उपलब्ध होने पर भरेंगी; कोई dummy market value नहीं दिखाई जाएगी।")
+
+    # Option Chain permanent shell
+    st.markdown('<div class="section-head">📊 Option Chain</div>', unsafe_allow_html=True)
+    oc = st.columns(6)
+    for col, label in zip(oc, ["ATM / Spot", "PCR", "Max Pain", "CALL OI", "PUT OI", "OI Change"]):
+        col.metric(label, "—")
+    st.caption("WAITING FOR LIVE OPTION-CHAIN DATA • यह box market बंद होने पर भी दिखाई देगा।")
+
+    # V2 permanent shell
+    render_trade_finder_v2({}, {15:{},30:{},60:{}}, {})
+
+    # Strategy / decision boxes
+    shell_sections = [
+        ("🎯 Entry Confirmation", ["Entry Score", "PA Confirmations", "5/8 EMA", "Entry Alert"]),
+        ("📈 5/8 EMA Momentum Filter", ["EMA 5", "EMA 8", "Spread", "Trend", "Cross"]),
+        ("🧭 Swing / Level Engine", ["Trend", "Setup", "Type", "Clear Path", "Raw Distance"]),
+        ("📌 Market Snapshot", ["Score", "HTF Bias", "Structure", "RSI", "ATR", "5/8 EMA"]),
+        ("📊 Market & Paper Status", ["Market", "Live Price", "WebSocket", "Paper Engine", "Trades Today", "Paper P&L"]),
+        ("🛡️ Phase-1 Risk Controls", ["ADX", "Session", "Entry Distance", "Setup Age", "Paper Risk"]),
+        ("🧾 Phase-2 Paper Execution", ["Paper Position", "Trades Today", "Realized P&L", "Unrealized P&L"]),
+        ("🗺️ Paper Entry / Exit Map", ["Entry", "Stop Loss", "Target", "Risk/Reward", "Quantity"]),
+        ("👁️ Phase-3 Monitoring & Audit", ["Paper Engine", "Live Price", "Audit Events", "Paper P&L"]),
+        ("📣 Signal Output", ["Direction", "Signal", "Risk / Reward", "Quantity"]),
+        ("🔎 Mandatory Checks", ["Data validation", "Completed candle", "Stale-data check", "Risk checks", "Minimum RR"]),
+        ("🧱 Key Levels", ["Previous Day High", "Previous Day Low", "VWAP", "Swing High", "Swing Low"]),
+        ("📝 Reasons / Invalidations", ["Reason codes", "Invalidations / blocks"]),
+        ("🕯️ Validated Candle Data", ["Timestamp", "Open", "High", "Low", "Close", "Volume", "VWAP", "RSI", "ATR", "ADX"]),
+    ]
+    for title, labels in shell_sections:
+        st.markdown(f'<div class="section-head">{title}</div>', unsafe_allow_html=True)
+        cols = st.columns(min(len(labels), 6))
+        for i, label in enumerate(labels):
+            cols[i % len(cols)].metric(label, "—")
+        if title == "📝 Reasons / Invalidations":
+            r1, r2 = st.columns(2)
+            r1.info("WAITING FOR MARKET DATA")
+            r2.info("No live invalidation data yet")
+        elif title == "🕯️ Validated Candle Data":
+            st.dataframe(pd.DataFrame([{label: "—" for label in labels}]), use_container_width=True, hide_index=True)
+        else:
+            st.caption("WAITING FOR LIVE / COMPLETED-CANDLE DATA")
+
+
 def dashboard(user, workspace):
     paper_user_id = getattr(user, "id", "")
     paper_workspace_id = workspace.get("id") if workspace else "default"
@@ -4001,7 +4061,12 @@ def dashboard(user, workspace):
     # Option Chain: live numbers update only while the cash market is LIVE.
     # After market close the last snapshot remains completely static.
     option_chain_root = st.empty()
-    option_chain_root.caption("📊 Option Chain: waiting for market data…")
+    with option_chain_root.container():
+        st.markdown('<div class="section-head">📊 Option Chain</div>', unsafe_allow_html=True)
+        _oc_shell = st.columns(6)
+        for _col, _label in zip(_oc_shell, ["ATM / Spot", "PCR", "Max Pain", "CALL OI", "PUT OI", "OI Change"]):
+            _col.metric(_label, "—")
+        st.caption("WAITING FOR LIVE OPTION-CHAIN DATA")
 
     def _option_chain_fingerprint(df, live_px):
         if df is None or df.empty:
@@ -4183,7 +4248,10 @@ def dashboard(user, workspace):
 
     access_token = st.session_state.get("fyers_access_token")
     if not access_token:
-        st.info("Live market data is managed in the background. Your dashboard remains available with last known data when live data is unavailable.")
+        if not st.session_state.get("trade_easy_permanent_shell_rendered"):
+            render_permanent_dashboard_shell()
+            st.session_state["trade_easy_permanent_shell_rendered"] = True
+        st.info("Live market data अभी उपलब्ध नहीं है। सभी dashboard boxes ऊपर/नीचे बने रहेंगे; values live data आते ही भरेंगी।")
         return
 
     # Live dashboard refresh: use Streamlit fragments so only the dynamic dashboard
@@ -4335,6 +4403,8 @@ def dashboard(user, workspace):
         data_ok, data_reasons = validate_candles(df, timeframe, max_stale)
         if df.empty or len(df) < 30:
             st.session_state["trade_easy_strategy_available"] = False
+            st.session_state["trade_easy_strategy_waiting_reason"] = "Completed candle history is not available yet."
+            # The permanent cards rendered before this fragment remain visible.
             return
 
         df = add_indicators(df)
