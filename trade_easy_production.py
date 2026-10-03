@@ -4139,7 +4139,18 @@ def dashboard(user, workspace):
     # the last completed-candle / last-known strategy snapshot whenever available.
     # This shell is updated only when the strategy snapshot itself changes; live
     # price has its own tiny ticker fragment and does not repaint these cards.
+    # Separate render roots are mandatory: permanent cards must never be
+    # replaced/cleared by the detailed live strategy output.
     strategy_root = st.empty()
+    strategy_detail_root = st.empty()
+    with strategy_detail_root.container():
+        st.markdown('<div class="section-head">🧩 Detailed Logic / Confirmation Output</div>', unsafe_allow_html=True)
+        st.caption("यह panel हमेशा मौजूद रहेगा। Live/completed-candle logic उपलब्ध होने पर इसी जगह वास्तविक result दिखाई देगा।")
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("Logic State", "WAITING")
+        d2.metric("Entry", "—")
+        d3.metric("Stop Loss", "—")
+        d4.metric("Target", "—")
 
     def _render_strategy_cards(snapshot=None):
         snap = snapshot or {}
@@ -4405,7 +4416,9 @@ def dashboard(user, workspace):
         if df.empty or len(df) < 30:
             st.session_state["trade_easy_strategy_available"] = False
             st.session_state["trade_easy_strategy_waiting_reason"] = "Completed candle history is not available yet."
-            # The permanent cards rendered before this fragment remain visible.
+            # Never clear strategy_root or strategy_detail_root here. Existing
+            # last-known content remains visible; the permanent shell already
+            # contains the WAITING state when no live/completed data exists.
             return
 
         df = add_indicators(df)
@@ -4698,8 +4711,8 @@ def dashboard(user, workspace):
             st.session_state["trade_easy_paper_display_version"] = version
 
         if strategy_signature == st.session_state.get("trade_easy_strategy_signature"):
-            # No new completed-candle strategy/event: keep the existing dashboard
-            # DOM untouched. Live price is handled by the tiny ticker fragment.
+            # No new completed-candle strategy/event: keep BOTH permanent render
+            # roots untouched. Live price is handled by the tiny ticker fragment.
             return
 
         # New completed-candle/event snapshot: update the cards once. They remain
@@ -4714,7 +4727,7 @@ def dashboard(user, workspace):
         # They are rendered even when a strategy is not yet confirmed.
         # Each panel reports its own logic state (WAITING / BUILDING / READY /
         # CONFIRMED / BLOCKED) instead of disappearing until the final signal.
-        with strategy_root.container():
+        with strategy_detail_root.container():
             if live_price is not None:
                 st.metric("Live Price", f"{live_price:,.2f}")
                 if tick_age is not None and tick_age <= 3.0:
