@@ -1890,104 +1890,99 @@ with check (public.trade_easy_is_admin());
 
 
 def login_page():
+    """Compact production login/signup screen. Auth logic kept intact."""
     st.markdown("""
     <style>
     .stApp {
         background:
-            radial-gradient(circle at 10% 10%, rgba(54,105,255,.25), transparent 28%),
-            radial-gradient(circle at 90% 10%, rgba(175,80,255,.20), transparent 30%),
-            linear-gradient(135deg,#071426,#101b35,#080d1b);
+            radial-gradient(circle at 8% 12%, rgba(45,110,255,.28), transparent 30%),
+            radial-gradient(circle at 92% 10%, rgba(175,80,255,.22), transparent 32%),
+            linear-gradient(135deg,#06111f,#0b1730 48%,#080d18);
     }
+    .block-container { padding-top: 2.2rem !important; padding-bottom: 1rem !important; }
+    .auth-shell { max-width: 470px; margin: 20px auto 0; }
     .auth-card {
-        max-width: 560px;
-        margin: 70px auto 20px auto;
-        padding: 34px;
-        border-radius: 24px;
-        background: rgba(255,255,255,.07);
-        border: 1px solid rgba(255,255,255,.12);
-        box-shadow: 0 20px 60px rgba(0,0,0,.30);
+        padding: 22px 24px 20px; border-radius: 20px;
+        background: rgba(255,255,255,.075); border:1px solid rgba(255,255,255,.14);
+        box-shadow: 0 18px 55px rgba(0,0,0,.32); backdrop-filter: blur(18px);
     }
-    .auth-title { color:#fff; font-size:36px; font-weight:900; }
-    .auth-sub { color:#aebbd2; margin-bottom:25px; }
+    .brand-row { display:flex; align-items:center; gap:12px; margin-bottom:5px; }
+    .brand-mark { width:42px; height:42px; border-radius:12px; display:flex; align-items:center; justify-content:center;
+        background:linear-gradient(135deg,#2563eb,#7c3aed); color:#fff; font-weight:900; font-size:18px;
+        box-shadow:0 8px 22px rgba(37,99,235,.30); }
+    .auth-title { color:#fff; font-size:27px; line-height:1.05; font-weight:900; letter-spacing:-.6px; }
+    .auth-sub { color:#9eacc3; font-size:12px; margin:3px 0 16px 54px; }
+    .auth-card [data-testid="stTextInput"] input { background:#fff !important; color:#111827 !important; border:1px solid #d7dce5 !important; border-radius:10px !important; }
+    .auth-card [data-testid="stTextInput"] label { color:#dbe5f5 !important; font-size:12px !important; font-weight:700 !important; }
+    .auth-card .stButton > button { min-height:40px !important; border-radius:10px !important; font-weight:800 !important; }
+    .auth-card [data-baseweb="tab-list"] { gap:4px; }
+    .auth-card [data-baseweb="tab"] { font-size:13px; font-weight:800; }
+    .auth-foot { text-align:center; color:#71819a; font-size:10px; margin-top:10px; }
     </style>
     """, unsafe_allow_html=True)
 
-    st.markdown(
-        '<div class="auth-card">'
-        '<div class="auth-title">Trade Easy Trading</div>'
-        '<div class="auth-sub">Index Trading Confirmation & Risk Control</div>'
-        '</div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown('<div class="auth-shell"><div class="auth-card"><div class="brand-row"><div class="brand-mark">TE</div><div class="auth-title">Trade Easy</div></div><div class="auth-sub">Smart Trading • Risk Control • Market Analysis</div>', unsafe_allow_html=True)
 
     login_tab, signup_tab = st.tabs(["🔐 Login", "🆕 Create Account"])
-
     with login_tab:
-        email = st.text_input("Email", key="login_email")
-        password = st.text_input("Password", type="password", key="login_password")
-
-        if st.button("Login", use_container_width=True, type="primary"):
+        email = st.text_input("Email", key="login_email", placeholder="Enter your email")
+        password = st.text_input("Password", type="password", key="login_password", placeholder="Enter your password")
+        if st.button("Login", use_container_width=True, type="primary", key="login_btn"):
             try:
-                result = supabase.auth.sign_in_with_password(
-                    {"email": email.strip(), "password": password}
-                )
+                result = supabase.auth.sign_in_with_password({"email": email.strip(), "password": password})
                 if getattr(result, "user", None):
-                    st.success("Login successful")
                     st.rerun()
                 else:
                     st.error("Login failed.")
             except Exception as e:
                 st.error(f"Login error: {e}")
 
-        st.divider()
+        forgot_col, _ = st.columns([1.15, 2.85])
+        with forgot_col:
+            if st.button("Forgot Password?", use_container_width=True, key="forgot_password_btn"):
+                if not email.strip():
+                    st.warning("पहले अपना email address डालें।")
+                else:
+                    try:
+                        password_reset_url = f"{TRADE_EASY_PUBLIC_URL.rstrip('/')}/?reset_password=1"
+                        supabase.auth.reset_password_for_email(email.strip(), {"redirect_to": password_reset_url})
+                        st.success("Password reset link भेज दिया गया है।")
+                    except Exception as e:
+                        st.error(f"Password reset error: {e}")
 
-        if st.button("Continue with Google", use_container_width=True):
+        st.markdown('<div style="height:6px"></div>', unsafe_allow_html=True)
+        if st.button("Continue with Google", use_container_width=True, key="google_login_btn"):
             try:
-                response = supabase.auth.sign_in_with_oauth(
-                    {
-                        "provider": "google",
-                        "options": {"redirect_to": REDIRECT_URL},
-                    }
-                )
+                response = supabase.auth.sign_in_with_oauth({
+                    "provider": "google",
+                    "options": {
+                        "redirect_to": REDIRECT_URL,
+                        "query_params": {"prompt": "select_account"},
+                    },
+                })
                 url = getattr(response, "url", None)
                 if url:
-                    st.markdown(
-                        f'<meta http-equiv="refresh" content="0; url={url}">',
-                        unsafe_allow_html=True,
-                    )
-                    st.info("Google Login खोल रहा है...")
+                    st.markdown(f'<meta http-equiv="refresh" content="0; url={url}">', unsafe_allow_html=True)
                 else:
                     st.error("Google OAuth URL नहीं मिला।")
             except Exception as e:
                 st.error(f"Google login error: {e}")
 
     with signup_tab:
-        name = st.text_input("Name", key="signup_name")
-        email = st.text_input("Email", key="signup_email")
-        password = st.text_input("Password", type="password", key="signup_password")
-
-        if st.button("Create Account", use_container_width=True, type="primary"):
+        name = st.text_input("Name", key="signup_name", placeholder="Your name")
+        email = st.text_input("Email", key="signup_email", placeholder="Your email")
+        password = st.text_input("Password", type="password", key="signup_password", placeholder="Create password")
+        if st.button("Create Account", use_container_width=True, type="primary", key="signup_btn"):
             try:
-                result = supabase.auth.sign_up(
-                    {
-                        "email": email.strip(),
-                        "password": password,
-                        "options": {
-                            "data": {
-                                "display_name": name.strip(),
-                                "full_name": name.strip(),
-                            }
-                        },
-                    }
-                )
+                result = supabase.auth.sign_up({"email": email.strip(), "password": password, "options": {"data": {"display_name": name.strip(), "full_name": name.strip()}}})
                 if getattr(result, "user", None):
-                    st.success(
-                        "Account created. अगर email confirmation enabled है तो पहले email confirm करें।"
-                    )
+                    st.success("Account created. Email confirmation करें अगर required हो।")
                 else:
                     st.error("Account creation failed.")
             except Exception as e:
                 st.error(f"Signup error: {e}")
+
+    st.markdown('</div><div class="auth-foot">Trade Easy • Secure authentication</div></div>', unsafe_allow_html=True)
 
 
 # ============================================================
@@ -4690,12 +4685,9 @@ def dashboard(user, workspace):
                 st.success("Signal audit save request completed.")
     
 
-    # Invisible strategy polling fragment: it writes to strategy_root only when
-    # a new confirmed strategy or paper-trade event is detected.
-    if hasattr(st, "fragment"):
-        _render_full_dashboard = st.fragment(
-            run_every="2s", key="trade_easy_strategy_dashboard"
-        )(_render_full_dashboard)
+    # Keep the complete dashboard rendered in the normal Streamlit flow.
+    # Live sub-sections use their own fragments; the full dashboard must never
+    # be replaced by a polling fragment, otherwise the UI can briefly disappear.
     _render_full_dashboard()
 
 # ============================================================
