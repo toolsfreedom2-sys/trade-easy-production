@@ -1366,12 +1366,13 @@ def admin_reset_user_password(user_id, new_password):
 
 
 def admin_bootstrap_admin_password(email, bootstrap_token, new_password):
-    """One-time pre-login password bootstrap for the configured first admin.
+    """Pre-login first-admin password bootstrap using a server-only Supabase secret.
 
-    This intentionally runs before authentication, so the admin does not need
-    to reach the Admin Dashboard to recover a broken/unknown password. Access
-    is gated by two Streamlit Secrets: the exact admin email and a private
-    bootstrap token. The Supabase secret key is never shown to the user.
+    The previous implementation queried PostgREST directly by email. This
+    version uses Supabase's server-side Auth Admin client first, then reads or
+    creates the matching public.profiles row. This avoids false "profile not
+    found" results caused by REST/RLS/key mismatches and gives a useful error
+    when the Streamlit Secrets point at the wrong project.
     """
     email = str(email or "").strip().lower()
     bootstrap_token = str(bootstrap_token or "")
@@ -1389,47 +1390,66 @@ def admin_bootstrap_admin_password(email, bootstrap_token, new_password):
         return False, "Password कम-से-कम 8 characters का होना चाहिए।"
 
     try:
-        profile_url = (
-            f"{SUPABASE_URL.rstrip('/')}/rest/v1/profiles"
-            f"?select=id,email,role,status&email=eq.{requests.utils.quote(email, safe='')}"
-        )
-        headers = {
-            "apikey": SUPABASE_SECRET_KEY,
-            "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
-        }
-        profile_response = requests.get(profile_url, headers=headers, timeout=15)
-        if profile_response.status_code >= 300:
-            return False, f"Admin profile verify failed ({profile_response.status_code})."
+        # Create a server-only client with the Supabase secret key.
+        # Supabase documents auth.admin methods as server-side only.
+        admin_client = create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
 
-        profiles = profile_response.json()
-        if not profiles:
-            return False, "Configured admin profile नहीं मिला। पहले Supabase profiles में admin user बनाएं।"
+        # Find the Auth user by email through the Admin API.
+        users_response = admin_client.auth.admin.list_users(page=1, per_page=1000)
+        users = getattr(users_response, "users", None)
+        if users is None and isinstance(users_response, dict):
+            users = users_response.get("users")
+        users = users or []
 
-        profile = profiles[0]
-        if str(profile.get("role", "")).lower() != "admin" or str(profile.get("status", "")).lower() != "active":
-            return False, "Admin profile का role='admin' और status='active' होना चाहिए।"
+        auth_user = None
+        for candidate in users:
+            candidate_email = str(getattr(candidate, "email", None) or "").strip().lower()
+            if not candidate_email and isinstance(candidate, dict):
+                candidate_email = str(candidate.get("email") or "").strip().lower()
+            if candidate_email == email:
+                auth_user = candidate
+                break
 
-        user_id = str(profile.get("id") or "").strip()
+        if auth_user is None:
+            return False, (
+                f"Supabase Auth में {email} नहीं मिला। "
+                "Streamlit Secrets का SUPABASE_URL वर्तमान Trade Easy Production project से match करें।"
+            )
+
+        user_id = str(getattr(auth_user, "id", None) or "").strip()
+        if not user_id and isinstance(auth_user, dict):
+            user_id = str(auth_user.get("id") or "").strip()
         if not user_id:
-            return False, "Admin user ID नहीं मिला।"
+            return False, "Supabase Auth user ID नहीं मिला।"
 
-        endpoint = f"{SUPABASE_URL.rstrip('/')}/auth/v1/admin/users/{user_id}"
-        response = requests.put(
-            endpoint,
-            headers={**headers, "Content-Type": "application/json"},
-            json={"password": new_password},
-            timeout=15,
+        # Ensure the public profile is Admin + Active. The secret-key client
+        # bypasses normal RLS restrictions for this trusted server operation.
+        profile_payload = {
+            "id": user_id,
+            "email": email,
+            "role": "admin",
+            "status": "active",
+            "updated_at": _utc_now().isoformat(),
+        }
+        profile_result = (
+            admin_client.table("profiles")
+            .upsert(profile_payload, on_conflict="id")
+            .execute()
         )
-        if 200 <= response.status_code < 300:
-            return True, None
+        if not profile_result.data:
+            return False, "Admin profile create/update नहीं हो सका। Supabase profiles schema check करें।"
 
-        try:
-            detail = response.json()
-        except Exception:
-            detail = response.text
-        return False, f"Supabase admin password update failed ({response.status_code}): {detail}"
+        # Set the Auth password through the official server-side Admin API.
+        admin_client.auth.admin.update_user_by_id(
+            user_id,
+            {"password": new_password, "email_confirm": True},
+        )
+
+        return True, None
+
     except Exception as exc:
-        return False, f"Admin bootstrap error: {exc}"
+        detail = str(exc)
+        return False, f"Admin bootstrap error: {detail}"
 
 
 def admin_update_profile(user_id, *, role=None, status=None):
