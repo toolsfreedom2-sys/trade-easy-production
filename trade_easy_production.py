@@ -8,6 +8,7 @@ import uuid
 import time
 import webbrowser
 import threading
+import unicodedata
 from pathlib import Path
 from hashlib import sha256
 from collections import deque
