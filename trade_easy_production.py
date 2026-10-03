@@ -70,7 +70,7 @@ SUPABASE_URL = _config_value("https://uuqbjhjzoicnzmiprmee.supabase.co")
 SUPABASE_PUBLISHABLE_KEY = _config_value("sb_publishable_gJmLuOGIPSibBWBpHY3uow_14b9geIj")
 
 TRADE_EASY_PUBLIC_URL = _config_value("https://tradeeasy.streamlit.app")
-REDIRECT_URL = _config_value("https://tradeeasy.streamlit.app/"L)
+REDIRECT_URL = _config_value("https://tradeeasy.streamlit.app/")
 
 FYERS_CONFIG_APP_ID = _config_value("K20QNFRUC0-100")
 FYERS_CONFIG_SECRET = _config_value("08VGJF3CU4") or _config_value("08VGJF3CU4")
