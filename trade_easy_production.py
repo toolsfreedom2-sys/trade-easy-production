@@ -3827,29 +3827,80 @@ def dashboard(user, workspace):
     # a missing/late broker session can never leave the page visually blank.
     # Live/last-known values are populated by the dynamic dashboard below.
     # ------------------------------------------------------------
-    st.markdown('<div class="section-head">Trade Easy Strategy Dashboard</div>', unsafe_allow_html=True)
-    st.caption("Dashboard ready • live values update only when new market/event data is available • last-known values stay visible")
-    q1, q2, q3, q4, q5 = st.columns(5)
-    q1.metric("Last Signal", "WAITING")
-    q2.metric("Direction", "—")
-    q3.metric("Score", "—")
-    q4.metric("HTF Bias", "—")
-    q5.metric("Structure", "—")
+    # ----------------------------------------------------------------
+    # SINGLE PERMANENT STRATEGY ROOT
+    # ----------------------------------------------------------------
+    # This root is created BEFORE Option Chain/V2 so the full strategy section
+    # has a stable place in the page. The live strategy fragment later updates
+    # this same root; it never creates a second copy.
+    strategy_root = st.empty()
 
-    st.markdown('<div class="section-head">Entry Confirmation</div>', unsafe_allow_html=True)
-    q1, q2, q3, q4 = st.columns(4)
-    q1.metric("Entry Score", "—")
-    q2.metric("PA Confirmations", "—")
-    q3.metric("5/8 EMA", "WAITING")
-    q4.metric("Entry Alert", "—")
+    def _render_strategy_placeholder():
+        with strategy_root.container():
+            st.markdown('<div class="section-head">Trade Easy Strategy Dashboard</div>', unsafe_allow_html=True)
+            st.caption("Dashboard हमेशा visible रहेगा • live/completed-candle values उपलब्ध होने पर इसी section में भरेंगी")
+            q1, q2, q3, q4, q5 = st.columns(5)
+            q1.metric("Last Signal", "WAITING")
+            q2.metric("Direction", "—")
+            q3.metric("Score", "—")
+            q4.metric("HTF Bias", "—")
+            q5.metric("Structure", "—")
 
-    st.markdown('<div class="section-head">Market & Paper Status</div>', unsafe_allow_html=True)
-    q1, q2, q3, q4, q5 = st.columns(5)
-    q1.metric("Live Price", "—")
-    q2.metric("Market", "WAITING")
-    q3.metric("Position", "FLAT")
-    q4.metric("Realized P&L", "₹0.00")
-    q5.metric("Paper Trades", "0/1")
+            st.markdown('<div class="section-head">Entry Confirmation</div>', unsafe_allow_html=True)
+            q1, q2, q3, q4 = st.columns(4)
+            q1.metric("Entry Score", "—")
+            q2.metric("PA Confirmations", "—")
+            q3.metric("5/8 EMA", "WAITING")
+            q4.metric("Entry Alert", "—")
+
+            st.markdown('<div class="section-head">5/8 EMA Momentum Filter</div>', unsafe_allow_html=True)
+            q1, q2, q3, q4, q5 = st.columns(5)
+            q1.metric("EMA 5", "—")
+            q2.metric("EMA 8", "—")
+            q3.metric("Spread", "—")
+            q4.metric("Trend", "WAITING")
+            q5.metric("Cross", "—")
+
+            st.markdown('<div class="section-head">Swing / Level Engine</div>', unsafe_allow_html=True)
+            q1, q2, q3, q4, q5 = st.columns(5)
+            q1.metric("Trend", "—")
+            q2.metric("Setup", "WAITING")
+            q3.metric("Type", "—")
+            q4.metric("Clear Path", "—")
+            q5.metric("50-Point Swing", "WAITING")
+
+            st.markdown('<div class="section-head">Market Snapshot</div>', unsafe_allow_html=True)
+            q1, q2, q3, q4, q5, q6 = st.columns(6)
+            q1.metric("Score", "—")
+            q2.metric("HTF Bias", "—")
+            q3.metric("Structure", "—")
+            q4.metric("RSI", "—")
+            q5.metric("ATR", "—")
+            q6.metric("5/8 EMA", "WAITING")
+
+            st.markdown('<div class="section-head">Phase-1 Risk Controls</div>', unsafe_allow_html=True)
+            q1, q2, q3, q4, q5 = st.columns(5)
+            q1.metric("ADX", "—")
+            q2.metric("Session", "WAITING")
+            q3.metric("Entry Distance", "—")
+            q4.metric("Setup Age", "—")
+            q5.metric("Paper Risk", "WAITING")
+
+            st.markdown('<div class="section-head">Phase-2 Paper Execution</div>', unsafe_allow_html=True)
+            q1, q2, q3, q4 = st.columns(4)
+            q1.metric("Paper Position", "FLAT")
+            q2.metric("Trades Today", "0/1")
+            q3.metric("Realized P&L", "₹0.00")
+            q4.metric("Unrealized P&L", "₹0.00")
+
+            st.markdown('<div class="section-head">Phase-3 Monitoring & Audit</div>', unsafe_allow_html=True)
+            q1, q2, q3, q4 = st.columns(4)
+            q1.metric("Paper Engine", "RUNNING")
+            q2.metric("Last Live Price", "—")
+            q3.metric("Audit Events", "0")
+            q4.metric("Paper P&L", "₹0.00")
+
+    _render_strategy_placeholder()
 
     with st.sidebar:
         st.header("Configuration")
@@ -4134,19 +4185,6 @@ def dashboard(user, workspace):
 
     _render_live_option_chain()
 
-    # ------------------------------------------------------------
-    # TRADE FINDER V2 — PERMANENT RENDER ROOT
-    # The V2 panel must never depend on the strategy fragment. This is critical
-    # during market-close/WAIT states where the fragment intentionally returns
-    # early. Live values are still updated from the same engine when available.
-    # ------------------------------------------------------------
-    v2_root = st.empty()
-    with v2_root.container():
-        _v2_cached_result = st.session_state.get("trade_easy_v2_result") or {}
-        _v2_cached_tfs = st.session_state.get("trade_easy_v2_timeframes") or {15:{}, 30:{}, 60:{}}
-        _v2_cached_oi = st.session_state.get("trade_easy_v2_oi_history") or {}
-        render_trade_finder_v2(_v2_cached_result, _v2_cached_tfs, _v2_cached_oi)
-
     # Permanent Paper Trading control root. This is intentionally outside every
     # live fragment and every replaceable strategy root. It therefore remains
     # visible on WAITING, market-closed, no-data and live states alike.
@@ -4187,13 +4225,27 @@ def dashboard(user, workspace):
         if st.session_state.pop("paper_reset_notice", False):
             st.success("✅ Paper Trading reset हो गया — P&L ₹0, trades 0, open position साफ।")
 
+    # ------------------------------------------------------------
+    # TRADE FINDER V2 — PERMANENT RENDER ROOT
+    # The V2 panel must never depend on the strategy fragment. This is critical
+    # during market-close/WAIT states where the fragment intentionally returns
+    # early. Live values are still updated from the same engine when available.
+    # ------------------------------------------------------------
+    v2_root = st.empty()
+    with v2_root.container():
+        _v2_cached_result = st.session_state.get("trade_easy_v2_result") or {}
+        _v2_cached_tfs = st.session_state.get("trade_easy_v2_timeframes") or {15:{}, 30:{}, 60:{}}
+        _v2_cached_oi = st.session_state.get("trade_easy_v2_oi_history") or {}
+        render_trade_finder_v2(_v2_cached_result, _v2_cached_tfs, _v2_cached_oi)
+
     # Permanent dashboard shell. Cards are always visible and are populated with
     # the last completed-candle / last-known strategy snapshot whenever available.
     # This shell is updated only when the strategy snapshot itself changes; live
     # price has its own tiny ticker fragment and does not repaint these cards.
     # Separate render roots are mandatory: permanent cards must never be
     # replaced/cleared by the detailed live strategy output.
-    strategy_root = st.empty()
+    # strategy_root was created above the Option Chain and is the single stable
+    # location for all strategy cards. Never create another strategy root here.
     strategy_detail_root = st.empty()
     with strategy_detail_root.container():
         st.markdown('<div class="section-head">🧩 Detailed Logic / Confirmation Output</div>', unsafe_allow_html=True)
@@ -4311,7 +4363,10 @@ def dashboard(user, workspace):
             clear_pts = path.get("clear_path")
             raw_pts = path.get("raw_distance")
             s4.metric("Clear Path", f"{clear_pts:.1f} pts" if isinstance(clear_pts, (int, float)) and np.isfinite(clear_pts) else "—")
-            s5.metric("Raw Distance", f"{raw_pts:.1f} pts" if isinstance(raw_pts, (int, float)) and np.isfinite(raw_pts) else "—")
+            swing50 = bool(snap.get("clear_path_50_pass", False)) if snapshot else False
+            s5.metric("50-Point Swing", "PASS" if swing50 else ("WAIT" if snapshot else "WAITING"))
+            if isinstance(raw_pts, (int, float)) and np.isfinite(raw_pts):
+                st.caption(f"Raw distance: {raw_pts:.1f} pts • required meaningful move: {snap.get('meaningful_move_points', '—')} pts")
 
             st.markdown('<div class="section-head">Market Snapshot</div>', unsafe_allow_html=True)
             s1, s2, s3, s4, s5, s6 = st.columns(6)
@@ -4363,10 +4418,7 @@ def dashboard(user, workspace):
 
     access_token = st.session_state.get("fyers_access_token")
     if not access_token:
-        if not st.session_state.get("trade_easy_permanent_shell_rendered"):
-            render_permanent_dashboard_shell()
-            st.session_state["trade_easy_permanent_shell_rendered"] = True
-        st.info("Live market data अभी उपलब्ध नहीं है। सभी dashboard boxes ऊपर/नीचे बने रहेंगे; values live data आते ही भरेंगी।")
+        st.info("Live market data अभी उपलब्ध नहीं है। सभी dashboard panels ऊपर/नीचे बने रहेंगे; values live data आते ही भरेंगी।")
         return
 
     # Live dashboard refresh: use Streamlit fragments so only the dynamic dashboard
