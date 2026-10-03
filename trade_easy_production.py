@@ -1380,9 +1380,10 @@ def admin_reset_user_password(user_id, new_password):
 def admin_bootstrap_admin_password(email, bootstrap_token, new_password):
     """Pre-login first-admin password bootstrap using Supabase Auth Admin SDK.
 
-    This runs only on the Streamlit server. The configured bootstrap token
-    gates the operation, while the Supabase secret key authorizes the
-    server-side Auth Admin call.
+    The configured public.profiles row is the authoritative application-side
+    link to auth.users because profiles.id == auth.users.id in this project.
+    We therefore resolve the admin user ID from profiles first instead of
+    relying on list_users() pagination/email matching.
     """
     email = str(email or "").strip().lower()
     bootstrap_token = str(bootstrap_token or "")
@@ -1406,62 +1407,56 @@ def admin_bootstrap_admin_password(email, bootstrap_token, new_password):
     try:
         admin_client = get_supabase_admin()
 
-        # Find the Auth user using the official server-side Admin API.
-        users_response = admin_client.auth.admin.list_users(
-            page=1,
-            per_page=1000,
+        # The project's profile row is already known to exist for this admin,
+        # and profiles.id is the same UUID as auth.users.id. Resolve that UUID
+        # directly through the trusted server-side client.
+        profile_result = (
+            admin_client.table("profiles")
+            .select("id,email,role,status")
+            .eq("email", email)
+            .limit(1)
+            .execute()
         )
-        users = getattr(users_response, "users", None)
-        if users is None and isinstance(users_response, dict):
-            users = users_response.get("users")
-        users = users or []
+        profiles = profile_result.data or []
 
-        auth_user = None
-        for candidate in users:
-            candidate_email = str(
-                getattr(candidate, "email", None) or ""
-            ).strip().lower()
-            if not candidate_email and isinstance(candidate, dict):
-                candidate_email = str(
-                    candidate.get("email") or ""
-                ).strip().lower()
+        if not profiles:
+            return False, (
+                f"Supabase public.profiles में {email} नहीं मिला। "
+                "यह Streamlit app जिस Supabase project से जुड़ा है, उसमें "
+                "admin profile मौजूद है या नहीं जाँचें।"
+            )
 
-            if candidate_email == email:
-                auth_user = candidate
-                break
+        profile = profiles[0]
+        user_id = str(profile.get("id") or "").strip()
+        if not user_id:
+            return False, "Admin profile में user ID नहीं मिली।"
+
+        if str(profile.get("role", "")).lower() != "admin" or str(
+            profile.get("status", "")
+        ).lower() != "active":
+            return False, (
+                "Admin profile का role='admin' और status='active' होना चाहिए।"
+            )
+
+        # Confirm that this UUID actually exists in Supabase Auth, then update
+        # the password using the official Auth Admin API.
+        try:
+            auth_lookup = admin_client.auth.admin.get_user_by_id(user_id)
+            auth_user = getattr(auth_lookup, "user", None)
+            if auth_user is None and isinstance(auth_lookup, dict):
+                auth_user = auth_lookup.get("user")
+        except Exception as lookup_exc:
+            return False, (
+                "Supabase profile मिल गया, लेकिन Auth user lookup failed: "
+                f"{lookup_exc}"
+            )
 
         if auth_user is None:
             return False, (
-                f"Supabase Auth में {email} नहीं मिला। "
-                "SUPABASE_URL और Streamlit Secret की project matching जाँचें।"
+                f"Supabase Auth में user ID {user_id} नहीं मिला। "
+                "यह profile और auth.users के बीच mismatch है।"
             )
 
-        user_id = str(getattr(auth_user, "id", None) or "").strip()
-        if not user_id and isinstance(auth_user, dict):
-            user_id = str(auth_user.get("id") or "").strip()
-        if not user_id:
-            return False, "Supabase Auth user ID नहीं मिला।"
-
-        # Keep the application's admin profile synchronized.
-        profile_payload = {
-            "id": user_id,
-            "email": email,
-            "role": "admin",
-            "status": "active",
-            "updated_at": _utc_now().isoformat(),
-        }
-        profile_result = (
-            admin_client.table("profiles")
-            .upsert(profile_payload, on_conflict="id")
-            .execute()
-        )
-        if not profile_result.data:
-            return False, (
-                "Admin profile create/update नहीं हो सका। "
-                "Supabase profiles schema check करें।"
-            )
-
-        # Official Supabase Auth Admin password update.
         response = admin_client.auth.admin.update_user_by_id(
             user_id,
             {
@@ -1478,8 +1473,7 @@ def admin_bootstrap_admin_password(email, bootstrap_token, new_password):
         return True, None
 
     except Exception as exc:
-        detail = str(exc)
-        return False, f"Admin bootstrap error: {detail}"
+        return False, f"Admin bootstrap error: {exc}"
 
 
 def admin_update_profile(user_id, *, role=None, status=None):
