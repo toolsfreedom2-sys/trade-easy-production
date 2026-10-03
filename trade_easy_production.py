@@ -1939,6 +1939,24 @@ def login_page():
             except Exception as e:
                 st.error(f"Login error: {e}")
 
+        forgot_col, _ = st.columns([1, 3])
+        with forgot_col:
+            if st.button("Forgot Password?", use_container_width=True, key="forgot_password_btn"):
+                if not email.strip():
+                    st.warning("पहले अपना email address डालें।")
+                else:
+                    try:
+                        password_reset_url = f"{TRADE_EASY_PUBLIC_URL.rstrip('/')}/?reset_password=1"
+                        supabase.auth.reset_password_for_email(
+                            email.strip(),
+                            {"redirect_to": password_reset_url},
+                        )
+                        st.success(
+                            "Password reset link भेज दिया गया है। Email खोलें और उसी Trade Easy page पर नया password सेट करें।"
+                        )
+                    except Exception as e:
+                        st.error(f"Password reset error: {e}")
+
         st.divider()
 
         if st.button("Continue with Google", use_container_width=True):
@@ -4365,6 +4383,76 @@ def main():
             clear_oauth_params()
             st.error(f"Google login callback error: {e}")
             st.stop()
+
+    # Password recovery flow. The reset email redirects to the deployed app
+    # with ?reset_password=1&code=... . Exchange that code into a session,
+    # then let the user set a new password using update_user().
+    reset_requested = (
+        st.query_params.get("reset_password") == "1"
+        or bool(st.session_state.get("password_recovery"))
+    )
+
+    if reset_requested and oauth_code and user is None:
+        try:
+            response = supabase.auth.exchange_code_for_session({"auth_code": oauth_code})
+            if getattr(response, "user", None) is not None:
+                st.session_state["password_recovery"] = True
+                clear_oauth_params()
+                st.rerun()
+            user = get_current_user()
+            if user is not None:
+                st.session_state["password_recovery"] = True
+                clear_oauth_params()
+                st.rerun()
+            clear_oauth_params()
+            st.error("Password reset session नहीं बन सकी। Reset link दोबारा भेजें।")
+            st.stop()
+        except Exception as e:
+            clear_oauth_params()
+            st.error(f"Password reset callback error: {e}")
+            st.stop()
+
+    if st.session_state.get("password_recovery"):
+        if user is None:
+            clear_oauth_params()
+            st.session_state.pop("password_recovery", None)
+            login_page()
+            return
+
+        st.markdown("## 🔐 Set New Password")
+        st.info("आपका password reset link सही है। नया password सेट करें।")
+        new_password = st.text_input(
+            "New Password",
+            type="password",
+            key="recovery_new_password",
+        )
+        confirm_password = st.text_input(
+            "Confirm New Password",
+            type="password",
+            key="recovery_confirm_password",
+        )
+        if st.button("Update Password", type="primary", use_container_width=True, key="recovery_update_btn"):
+            if len(new_password) < 8:
+                st.error("Password कम-से-कम 8 characters का होना चाहिए।")
+            elif new_password != confirm_password:
+                st.error("दोनों passwords match नहीं कर रहे हैं।")
+            else:
+                try:
+                    response = supabase.auth.update_user({"password": new_password})
+                    if getattr(response, "user", None) is not None:
+                        st.success("✅ Password successfully updated. अब आप Trade Easy में login कर सकते हैं।")
+                        try:
+                            supabase.auth.sign_out()
+                        except Exception:
+                            pass
+                        st.session_state.pop("password_recovery", None)
+                        clear_oauth_params()
+                        st.rerun()
+                    else:
+                        st.error("Password update failed.")
+                except Exception as e:
+                    st.error(f"Password update error: {e}")
+        st.stop()
 
     if user is None:
         login_page()
