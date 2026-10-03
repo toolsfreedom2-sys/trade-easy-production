@@ -69,7 +69,7 @@ def _config_value(name: str, default: str = "") -> str:
 SUPABASE_URL = ("https://uuqbjhjzoicnzmiprmee.supabase.co")
 SUPABASE_PUBLISHABLE_KEY = ("sb_publishable_gJmLuOGIPSibBWBpHY3uow_14b9geIj")
 TRADE_EASY_PUBLIC_URL = _config_value("https://tradeeasy.streamlit.app")
-REDIRECT_URL = ("https://tradeeasy.streamlit.app/)
+REDIRECT_URL = _config_value("https://tradeeasy.streamlit.app/)
 
 FYERS_CONFIG_APP_ID = ("K20QNFRUC0-100")
 FYERS_CONFIG_SECRET = ("08VGJF3CU4")
