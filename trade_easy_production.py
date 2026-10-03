@@ -4231,6 +4231,7 @@ def dashboard(user, workspace):
             s4.metric("Unrealized P&L", f"₹{float(paper.get('unrealized_pnl', 0.0)):,.2f}")
 
             st.markdown('<div class="section-head">Phase-3 Monitoring & Audit</div>', unsafe_allow_html=True)
+            st.caption("🟢 LOGIC ACTIVE — monitoring/audit remains visible continuously." if not paper.get("paper_kill_switch") else "🔴 LOGIC PAUSED — paper kill switch is active; audit remains visible.")
             s1, s2, s3, s4 = st.columns(4)
             s1.metric("Paper Engine", "KILLED" if paper.get("paper_kill_switch") else "RUNNING")
             s2.metric("Last Live Price", f"₹{snap['live_price']:,.2f}" if snap.get("live_price") is not None else "—")
@@ -4709,11 +4710,10 @@ def dashboard(user, workspace):
         _render_strategy_cards(strategy_snapshot)
         state_icon = {"BUY": "🟢", "SELL": "🔴", "WAIT": "🟡", "BLOCKED": "⛔"}[signal]
 
-        # Detailed confirmed-strategy output is shown only when a real strategy
-        # is confirmed. The permanent cards above already contain the last data.
-        if not strategy_available:
-            return
-
+        # IMPORTANT: Detailed logic panels are PERMANENT.
+        # They are rendered even when a strategy is not yet confirmed.
+        # Each panel reports its own logic state (WAITING / BUILDING / READY /
+        # CONFIRMED / BLOCKED) instead of disappearing until the final signal.
         with strategy_root.container():
             if live_price is not None:
                 st.metric("Live Price", f"{live_price:,.2f}")
@@ -4753,6 +4753,7 @@ def dashboard(user, workspace):
                 st.success(f"{signal} candidate: score ≥ 75 and mandatory risk checks passed.")
     
             st.markdown('<div class="section-head">Entry Confirmation</div>', unsafe_allow_html=True)
+            st.caption("🟢 LOGIC COMPLETE" if signal in ("BUY", "SELL") and risk_ok and ema_state.get("confirmed") and level_setup.get("status") == "CONFIRMED" else "🟡 LOGIC PENDING — conditions will appear here as they are satisfied.")
             ec1, ec2, ec3, ec4 = st.columns(4)
             ec1.metric("Entry Score", f"{score}/75")
             ec2.metric("PA Confirmations", f"{confirmation_count}/2")
@@ -4760,6 +4761,7 @@ def dashboard(user, workspace):
             ec4.metric("Entry Alert", "YES" if signal in ("BUY", "SELL") else "NO")
 
             st.markdown('<div class="section-head">5/8 EMA Momentum Filter</div>', unsafe_allow_html=True)
+            st.caption("🟢 LOGIC COMPLETE — EMA 5/8 confirmation passed." if ema_state.get("confirmed") else "🟡 LOGIC PENDING — waiting for direction + EMA 5/8 confirmation.")
             em1, em2, em3, em4, em5 = st.columns(5)
             em1.metric("EMA 5", f"{float(df['ema_5'].iloc[-1]):,.2f}")
             em2.metric("EMA 8", f"{float(df['ema_8'].iloc[-1]):,.2f}")
@@ -4785,6 +4787,7 @@ def dashboard(user, workspace):
                 )
     
             st.markdown('<div class="section-head">Swing / Level Engine</div>', unsafe_allow_html=True)
+            st.caption("🟢 LOGIC COMPLETE — level setup confirmed." if level_setup.get("status") == "CONFIRMED" else ("🔴 LOGIC BLOCKED — no qualifying path/setup." if level_setup.get("status") == "NO TRADE" else "🟡 LOGIC BUILDING — waiting for level/path confirmations."))
             lc1, lc2, lc3, lc4, lc5 = st.columns(5)
             lc1.metric("Trend", bias or "—")
             lc2.metric("Setup", level_setup.get("status", "—"))
@@ -4814,14 +4817,23 @@ def dashboard(user, workspace):
                 oc5.metric("PCR", f"{option_summary['pcr']:.2f}" if np.isfinite(option_summary['pcr']) else "—")
             else:
                 st.caption(f"OI/OI Change: {option_chain_error or 'Option-chain data not available'} — no invented OI values.")
+            st.markdown('<div class="section-head">Paper Entry / Exit Map</div>', unsafe_allow_html=True)
             if plan:
-                st.markdown('<div class="section-head">Paper Entry / Exit Map</div>', unsafe_allow_html=True)
                 pc1, pc2, pc3, pc4, pc5 = st.columns(5)
                 pc1.metric("Entry Price", f"₹{plan['entry']:,.2f}")
                 pc2.metric("Live Price", f"₹{live_price:,.2f}" if live_price is not None else "—")
                 pc3.metric("Stop Loss", f"₹{plan['stop_loss']:,.2f}")
                 pc4.metric("Target", f"₹{plan['target']:,.2f}")
                 pc5.metric("Quantity", PAPER_FIXED_QUANTITY)
+                st.success("🟢 ENTRY/EXIT LOGIC READY — trade plan calculated from the current validated setup.")
+            else:
+                pc1, pc2, pc3, pc4, pc5 = st.columns(5)
+                pc1.metric("Entry Price", "—")
+                pc2.metric("Live Price", f"₹{live_price:,.2f}" if live_price is not None else "—")
+                pc3.metric("Stop Loss", "—")
+                pc4.metric("Target", "—")
+                pc5.metric("Quantity", PAPER_FIXED_QUANTITY)
+                st.warning("🟡 ENTRY/EXIT LOGIC PENDING — a valid direction/setup is required before prices are calculated.")
 
             st.markdown('<div class="section-head">Market Snapshot</div>', unsafe_allow_html=True)
             m1, m2, m3, m4, m5, m6 = st.columns(6)
@@ -4832,6 +4844,7 @@ def dashboard(user, workspace):
             m5.metric("ATR", f"{df['atr'].iloc[-1]:.2f}" if pd.notna(df["atr"].iloc[-1]) else "—")
             m6.metric("5/8 EMA", ema_state.get("trend", "—"))
             st.markdown('<div class="section-head">Phase-1 Risk Controls</div>', unsafe_allow_html=True)
+            st.caption("🟢 LOGIC COMPLETE — mandatory risk/session checks passed." if risk_ok and not phase1_failures else "🔴 LOGIC BLOCKED — one or more mandatory risk/session checks failed or are pending.")
             rc1, rc2, rc3, rc4, rc5 = st.columns(5)
             rc1.metric("ADX", f"{adx_value:.1f}" if adx_value is not None else "—", "PASS" if adx_value is not None and adx_value >= float(adx_min) else "WEAK")
             rc2.metric("Session", "OPEN" if not session_status["failures"] else "BLOCKED")
@@ -4842,6 +4855,7 @@ def dashboard(user, workspace):
                 st.markdown('<div class="pending-box">Phase-1 blocks: ' + ' &nbsp; • &nbsp; '.join(phase1_failures) + '</div>', unsafe_allow_html=True)
     
             st.markdown('<div class="section-head">Phase-2 Paper Execution</div>', unsafe_allow_html=True)
+            st.caption("🟢 LOGIC ACTIVE — paper execution engine is ready to act only after the final entry alert." if not paper_state.get("paper_kill_switch") else "🔴 LOGIC BLOCKED — paper kill switch is active.")
             pe1, pe2, pe3, pe4 = st.columns(4)
             pe1.metric("Paper Position", "OPEN" if paper_state.get("open_position") else "FLAT")
             pe2.metric("Trades Today", f"{trades_today}/{int(max_trades)}")
