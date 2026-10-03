@@ -66,8 +66,8 @@ def _config_value(name: str, default: str = "") -> str:
     return str(os.environ.get(name, default) or "").strip()
 
 
-SUPABASE_URL = ("https://uuqbjhjzoicnzmiprmee.supabase.co")
-SUPABASE_PUBLISHABLE_KEY = ("sb_publishable_gJmLuOGIPSibBWBpHY3uow_14b9geIj")
+SUPABASE_URL = _config_value("https://uuqbjhjzoicnzmiprmee.supabase.co")
+SUPABASE_PUBLISHABLE_KEY = _config_value("sb_publishable_gJmLuOGIPSibBWBpHY3uow_14b9geIj")
 TRADE_EASY_PUBLIC_URL = _config_value("https://tradeeasy.streamlit.app")
 REDIRECT_URL = _config_value("https://tradeeasy.streamlit.app/)
 
