@@ -68,7 +68,7 @@ def _config_value(name: str, default: str = "") -> str:
 SUPABASE_URL = _config_value("https://uuqbjhjzoicnzmiprmee.supabase.co")
 SUPABASE_PUBLISHABLE_KEY = _config_value("sb_publishable_gJmLuOGIPSibBWBpHY3uow_14b9geIj")
 
-TRADE_EASY_PUBLIC_URL = _config_value("https://tradeeasy.streamlit.app")
+TRADE_EASY_PUBLIC_URL = _config_value("https://tradeeasy.streamlit.app/")
 REDIRECT_URL = _config_value(
     "https://tradeeasy.streamlit.app/",
     TRADE_EASY_PUBLIC_URL
@@ -76,9 +76,10 @@ REDIRECT_URL = _config_value(
 
 FYERS_CONFIG_APP_ID = _config_value("K20QNFRUC0-100")
 FYERS_CONFIG_SECRET = (
-    _config_value("NE3UQ1WDEH")
+    _config_value("FYERS_SECRET_KEY")
     or _config_value("NE3UQ1WDEH")
 )
+
 FYERS_REDIRECT_URI = _config_value("FYERS_REDIRECT_URI")
 
 if not FYERS_REDIRECT_URI and TRADE_EASY_PUBLIC_URL:
