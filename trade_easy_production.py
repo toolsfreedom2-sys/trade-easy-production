@@ -4528,49 +4528,114 @@ def dashboard(user, workspace):
 # ============================================================
 # PASSWORD RECOVERY: DEFAULT SUPABASE EMAIL (NO CUSTOM SMTP)
 # ============================================================
-# Supabase default recovery links normally return access_token / refresh_token
-# in the browser URL fragment (#...). Streamlit's Python backend cannot read
-# URL fragments. This tiny trusted bridge copies ONLY the recovery fragment
-# values into temporary query parameters, then reloads the same app URL.
-# The server can then call supabase.auth.set_session(), show the Set New
-# Password page, and immediately clear the query parameters.
+# IMPORTANT: Supabase's default reset link uses the browser URL fragment
+# (#access_token=...&refresh_token=...). The fragment never reaches the
+# Streamlit Python backend. Therefore the most reliable no-SMTP solution is
+# to complete the recovery entirely in the browser with Supabase JS.
 #
-# This keeps the solution compatible with Supabase's default email template
-# and does NOT require custom SMTP.
+# The component is blank during normal login. When a recovery fragment is
+# present, it reads the fragment in the top-level browser URL, creates a
+# recovery session with Supabase JS, lets the user set a new password, then
+# redirects back to the clean Trade Easy login URL.
 
-def _bridge_supabase_recovery_fragment():
+def _browser_password_recovery():
     try:
         components.html(
-            """
+            f"""
+            <div id="trade-easy-recovery-root" style="display:none;position:fixed;inset:0;z-index:2147483647;background:#08111f;color:#fff;font-family:Arial,sans-serif;padding:30px;box-sizing:border-box;overflow:auto;">
+              <div style="max-width:520px;margin:60px auto;background:rgba(255,255,255,.08);border:1px solid rgba(255,255,255,.15);border-radius:20px;padding:28px;box-shadow:0 20px 70px rgba(0,0,0,.45);">
+                <h2 style="margin:0 0 8px;">🔐 Set New Password</h2>
+                <p id="trade-easy-recovery-msg" style="color:#b8c5d9;">Password reset session verify हो रही है...</p>
+                <div id="trade-easy-recovery-form" style="display:none;">
+                  <label style="display:block;margin:14px 0 6px;">New Password</label>
+                  <input id="trade-easy-new-password" type="password" autocomplete="new-password" style="width:100%;padding:12px;border-radius:10px;border:1px solid #44546b;background:#101b2d;color:#fff;box-sizing:border-box;">
+                  <label style="display:block;margin:14px 0 6px;">Confirm New Password</label>
+                  <input id="trade-easy-confirm-password" type="password" autocomplete="new-password" style="width:100%;padding:12px;border-radius:10px;border:1px solid #44546b;background:#101b2d;color:#fff;box-sizing:border-box;">
+                  <button id="trade-easy-update-password" style="margin-top:20px;width:100%;padding:13px;border:0;border-radius:10px;background:#2563eb;color:#fff;font-size:16px;font-weight:700;cursor:pointer;">Update Password</button>
+                </div>
+              </div>
+            </div>
+            <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
             <script>
-            (() => {
-                try {
-                    const parentWindow = window.parent;
-                    const hash = parentWindow.location.hash || '';
-                    if (!hash || !hash.includes('access_token=')) return;
+            (() => {{
+              const root = document.getElementById('trade-easy-recovery-root');
+              const msg = document.getElementById('trade-easy-recovery-msg');
+              const form = document.getElementById('trade-easy-recovery-form');
+              const btn = document.getElementById('trade-easy-update-password');
+              const newPw = document.getElementById('trade-easy-new-password');
+              const confirmPw = document.getElementById('trade-easy-confirm-password');
 
-                    const params = new URLSearchParams(hash.substring(1));
-                    const accessToken = params.get('access_token');
-                    const refreshToken = params.get('refresh_token');
-                    const type = (params.get('type') || '').toLowerCase();
+              function cleanAppUrl() {{
+                const u = new URL(window.top.location.href);
+                u.hash = '';
+                u.searchParams.delete('reset_password');
+                u.searchParams.delete('recovery_access_token');
+                u.searchParams.delete('recovery_refresh_token');
+                u.searchParams.delete('recovery_type');
+                u.searchParams.set('password_reset_success', '1');
+                return u.toString();
+              }}
 
-                    if (!accessToken || !refreshToken || type !== 'recovery') return;
+              async function run() {{
+                try {{
+                  const topUrl = new URL(window.top.location.href);
+                  const hash = topUrl.hash || '';
+                  if (!hash || !hash.includes('access_token=')) return;
 
-                    const url = new URL(parentWindow.location.href);
-                    url.searchParams.set('reset_password', '1');
-                    url.searchParams.set('recovery_access_token', accessToken);
-                    url.searchParams.set('recovery_refresh_token', refreshToken);
-                    url.searchParams.set('recovery_type', type);
-                    url.hash = '';
+                  const params = new URLSearchParams(hash.substring(1));
+                  const accessToken = params.get('access_token');
+                  const refreshToken = params.get('refresh_token');
+                  const type = (params.get('type') || '').toLowerCase();
+                  if (!accessToken || !refreshToken || type !== 'recovery') return;
 
-                    parentWindow.location.replace(url.toString());
-                } catch (e) {
-                    // Do not expose tokens or details in the UI.
-                }
-            })();
+                  root.style.display = 'block';
+                  try {{ if (window.frameElement) window.frameElement.style.height = '560px'; }} catch (_) {{}}
+                  const sb = window.supabase.createClient(
+                    {SUPABASE_URL!r},
+                    {SUPABASE_PUBLISHABLE_KEY!r},
+                    {{ auth: {{ persistSession: false, autoRefreshToken: true, detectSessionInUrl: false }} }}
+                  );
+
+                  const result = await sb.auth.setSession({{
+                    access_token: accessToken,
+                    refresh_token: refreshToken
+                  }});
+                  if (result.error) throw result.error;
+                  if (!result.data || !result.data.user) throw new Error('Recovery user session नहीं मिली।');
+
+                  msg.textContent = 'Recovery verified. नया password नीचे सेट करें।';
+                  form.style.display = 'block';
+
+                  btn.onclick = async () => {{
+                    const a = newPw.value || '';
+                    const b = confirmPw.value || '';
+                    if (a.length < 8) {{ msg.textContent = 'Password कम-से-कम 8 characters का होना चाहिए।'; return; }}
+                    if (a !== b) {{ msg.textContent = 'दोनों passwords match नहीं कर रहे हैं।'; return; }}
+                    btn.disabled = true;
+                    btn.textContent = 'Updating...';
+                    try {{
+                      const updated = await sb.auth.updateUser({{ password: a }});
+                      if (updated.error) throw updated.error;
+                      msg.textContent = '✅ Password successfully updated. Login page खुल रहा है...';
+                      await sb.auth.signOut();
+                      setTimeout(() => {{ window.top.location.replace(cleanAppUrl()); }}, 700);
+                    }} catch (e) {{
+                      msg.textContent = 'Password update failed: ' + (e && e.message ? e.message : 'Unknown error');
+                      btn.disabled = false;
+                      btn.textContent = 'Update Password';
+                    }}
+                  }};
+                }} catch (e) {{
+                  root.style.display = 'block';
+                  try {{ if (window.frameElement) window.frameElement.style.height = '560px'; }} catch (_) {{}}
+                  msg.textContent = 'Password reset link verify नहीं हो सका: ' + (e && e.message ? e.message : 'Unknown error');
+                }}
+              }}
+              run();
+            }})();
             </script>
             """,
-            height=0,
+            height=1,
             width=0,
         )
     except Exception:
@@ -4589,7 +4654,7 @@ def main():
     # Handle the URL fragment produced by Supabase's DEFAULT password-reset
     # email. This runs before Python reads st.query_params because fragments
     # are browser-only and are not sent to the Streamlit server.
-    _bridge_supabase_recovery_fragment()
+    _browser_password_recovery()
 
     # Production credentials are loaded from Streamlit Secrets/environment.
     if FYERS_CONFIG_APP_ID:
