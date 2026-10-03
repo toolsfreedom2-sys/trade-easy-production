@@ -73,7 +73,7 @@ TRADE_EASY_PUBLIC_URL = _config_value("https://tradeeasy.streamlit.app")
 REDIRECT_URL = _config_value("https://tradeeasy.streamlit.app/")
 
 FYERS_CONFIG_APP_ID = _config_value("K20QNFRUC0-100")
-FYERS_CONFIG_SECRET = _config_value("08VGJF3CU4") or _config_value("08VGJF3CU4")
+FYERS_CONFIG_SECRET = _config_value("NE3UQ1WDEH") or _config_value("08VGJF3CU4")
 FYERS_REDIRECT_URI = _config_value("https://tradeeasy.streamlit.app/")
 
 if not FYERS_REDIRECT_URI and TRADE_EASY_PUBLIC_URL:
