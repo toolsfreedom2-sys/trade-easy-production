@@ -3547,15 +3547,10 @@ def render_permanent_dashboard_shell():
     st.markdown('<div class="section-head">📦 Dashboard — All Panels</div>', unsafe_allow_html=True)
     st.caption("सभी panels हमेशा दिखाई देंगे। Live-only values केवल market/live data उपलब्ध होने पर भरेंगी; कोई dummy market value नहीं दिखाई जाएगी।")
 
-    # Option Chain permanent shell
-    st.markdown('<div class="section-head">📊 Option Chain</div>', unsafe_allow_html=True)
-    oc = st.columns(6)
-    for col, label in zip(oc, ["ATM / Spot", "PCR", "Max Pain", "CALL OI", "PUT OI", "OI Change"]):
-        col.metric(label, "—")
-    st.caption("WAITING FOR LIVE OPTION-CHAIN DATA • यह box market बंद होने पर भी दिखाई देगा।")
-
-    # V2 permanent shell
-    render_trade_finder_v2({}, {15:{},30:{},60:{}}, {})
+    # NOTE: Option Chain and Trade Finder V2 have their own dedicated, stable
+    # render roots in dashboard(). They are intentionally NOT rendered here;
+    # rendering them in this fallback shell would create duplicate panels.
+    # Option Chain remains the only live-data-first section as requested.
 
     # Strategy / decision boxes
     shell_sections = [
