@@ -2080,7 +2080,7 @@ def login_page():
 
     /* The authentication row itself becomes the popup. */
     .stApp .stHorizontalBlock {
-        max-width: 460px !important;
+        max-width: 520px !important;
         margin: 7vh auto 0 auto !important;
         align-items: stretch !important;
     }
@@ -2092,7 +2092,7 @@ def login_page():
         flex: 0 0 100% !important;
         width: 100% !important;
         max-width: 100% !important;
-        padding: 24px 30px 22px !important;
+        padding: 24px 34px 24px !important;
         border-radius: 22px !important;
         background: rgba(12,20,35,.92) !important;
         border: 1px solid rgba(148,163,184,.20) !important;
@@ -2195,7 +2195,7 @@ def login_page():
                 except Exception as e:
                     st.error(f"Login error: {e}")
 
-            forgot_col, spacer = st.columns([1.25, 1])
+            forgot_left, forgot_col, forgot_right = st.columns([1, 1.35, 1])
             with forgot_col:
                 if st.button("Forgot Password?", use_container_width=True, key="forgot_password_btn"):
                     if not email.strip():
@@ -3333,18 +3333,31 @@ def dashboard(user, workspace):
     /* TOP HEADER + LOGOUT VISIBILITY FIX
        Keep Streamlit's top header from appearing as a white strip over the
        dashboard controls, and make dashboard action buttons readable. */
+    /* Remove Streamlit Cloud's built-in Share / Star / Edit / More toolbar. */
+    [data-testid="stToolbar"],
+    [data-testid="stHeaderActionElements"],
+    [data-testid="stDecoration"],
+    [data-testid="stStatusWidget"] {
+        display: none !important;
+        visibility: hidden !important;
+        pointer-events: none !important;
+    }
     [data-testid="stHeader"] {
-        background: #07111f !important;
-        border-bottom: 1px solid rgba(148,163,184,.14) !important;
-        box-shadow: none !important;
-        z-index: 1000 !important;
-    }
-    [data-testid="stHeader"]::before {
-        background: #07111f !important;
-    }
-    [data-testid="stToolbar"] {
+        height: 0 !important;
+        min-height: 0 !important;
         background: transparent !important;
+        border: 0 !important;
+        box-shadow: none !important;
+        z-index: 0 !important;
     }
+    [data-testid="stHeader"] > div {
+        display: none !important;
+    }
+    /* Fallback selectors for Streamlit Cloud header action controls. */
+    header button, header a, header [role="button"] {
+        display: none !important;
+    }
+
     /* Dashboard buttons: dark background + white text, including Logout. */
     div[data-testid="stButton"] > button {
         background: #172033 !important;
