@@ -1,4 +1,5 @@
 import hashlib
+import hmac
 import os
 import base64
 import math
@@ -69,6 +70,9 @@ SUPABASE_URL = _config_value("SUPABASE_URL")
 SUPABASE_PUBLISHABLE_KEY = _config_value("SUPABASE_PUBLISHABLE_KEY")
 # Server-only Supabase secret key. Never expose this in the UI or GitHub.
 SUPABASE_SECRET_KEY = _config_value("SUPABASE_SECRET_KEY")
+# One-time admin bootstrap gate. Keep both values in Streamlit Secrets only.
+TRADE_EASY_ADMIN_EMAIL = _config_value("TRADE_EASY_ADMIN_EMAIL", "markam296@gmail.com")
+TRADE_EASY_ADMIN_BOOTSTRAP_TOKEN = _config_value("TRADE_EASY_ADMIN_BOOTSTRAP_TOKEN")
 
 TRADE_EASY_PUBLIC_URL = _config_value("TRADE_EASY_PUBLIC_URL")
 
@@ -1360,6 +1364,73 @@ def admin_reset_user_password(user_id, new_password):
         return False, f"Password update error: {exc}"
 
 
+def admin_bootstrap_admin_password(email, bootstrap_token, new_password):
+    """One-time pre-login password bootstrap for the configured first admin.
+
+    This intentionally runs before authentication, so the admin does not need
+    to reach the Admin Dashboard to recover a broken/unknown password. Access
+    is gated by two Streamlit Secrets: the exact admin email and a private
+    bootstrap token. The Supabase secret key is never shown to the user.
+    """
+    email = str(email or "").strip().lower()
+    bootstrap_token = str(bootstrap_token or "")
+    new_password = str(new_password or "")
+
+    if not SUPABASE_SECRET_KEY:
+        return False, "SUPABASE_SECRET_KEY Streamlit Secrets में configured नहीं है।"
+    if not TRADE_EASY_ADMIN_BOOTSTRAP_TOKEN:
+        return False, "TRADE_EASY_ADMIN_BOOTSTRAP_TOKEN Streamlit Secrets में configured नहीं है।"
+    if not email or not hmac.compare_digest(email, TRADE_EASY_ADMIN_EMAIL.strip().lower()):
+        return False, "यह email configured first-admin email नहीं है।"
+    if not hmac.compare_digest(bootstrap_token, TRADE_EASY_ADMIN_BOOTSTRAP_TOKEN):
+        return False, "Admin bootstrap token गलत है।"
+    if len(new_password) < 8:
+        return False, "Password कम-से-कम 8 characters का होना चाहिए।"
+
+    try:
+        profile_url = (
+            f"{SUPABASE_URL.rstrip('/')}/rest/v1/profiles"
+            f"?select=id,email,role,status&email=eq.{requests.utils.quote(email, safe='')}"
+        )
+        headers = {
+            "apikey": SUPABASE_SECRET_KEY,
+            "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
+        }
+        profile_response = requests.get(profile_url, headers=headers, timeout=15)
+        if profile_response.status_code >= 300:
+            return False, f"Admin profile verify failed ({profile_response.status_code})."
+
+        profiles = profile_response.json()
+        if not profiles:
+            return False, "Configured admin profile नहीं मिला। पहले Supabase profiles में admin user बनाएं।"
+
+        profile = profiles[0]
+        if str(profile.get("role", "")).lower() != "admin" or str(profile.get("status", "")).lower() != "active":
+            return False, "Admin profile का role='admin' और status='active' होना चाहिए।"
+
+        user_id = str(profile.get("id") or "").strip()
+        if not user_id:
+            return False, "Admin user ID नहीं मिला।"
+
+        endpoint = f"{SUPABASE_URL.rstrip('/')}/auth/v1/admin/users/{user_id}"
+        response = requests.put(
+            endpoint,
+            headers={**headers, "Content-Type": "application/json"},
+            json={"password": new_password},
+            timeout=15,
+        )
+        if 200 <= response.status_code < 300:
+            return True, None
+
+        try:
+            detail = response.json()
+        except Exception:
+            detail = response.text
+        return False, f"Supabase admin password update failed ({response.status_code}): {detail}"
+    except Exception as exc:
+        return False, f"Admin bootstrap error: {exc}"
+
+
 def admin_update_profile(user_id, *, role=None, status=None):
     payload = {}
     if role is not None:
@@ -2016,6 +2087,53 @@ def login_page():
                         st.error(f"Password reset error: {e}")
 
         st.divider()
+
+        with st.expander("🔐 First-time Admin Password Setup"):
+            st.caption(
+                "यह केवल configured first-admin account के लिए है। "
+                "Admin Dashboard में जाने की जरूरत नहीं है।"
+            )
+            admin_email = st.text_input(
+                "Admin Email",
+                value=TRADE_EASY_ADMIN_EMAIL,
+                key="bootstrap_admin_email",
+            )
+            admin_token = st.text_input(
+                "Admin Bootstrap Token",
+                type="password",
+                key="bootstrap_admin_token",
+                help="यह token केवल Streamlit Secrets में configured होना चाहिए।",
+            )
+            admin_new_password = st.text_input(
+                "New Admin Password",
+                type="password",
+                key="bootstrap_admin_new_password",
+            )
+            admin_confirm_password = st.text_input(
+                "Confirm Admin Password",
+                type="password",
+                key="bootstrap_admin_confirm_password",
+            )
+
+            if st.button(
+                "Set Admin Password",
+                type="primary",
+                use_container_width=True,
+                key="bootstrap_admin_password_btn",
+            ):
+                if admin_new_password != admin_confirm_password:
+                    st.error("दोनों passwords match नहीं कर रहे हैं।")
+                else:
+                    ok, error = admin_bootstrap_admin_password(
+                        admin_email, admin_token, admin_new_password
+                    )
+                    if ok:
+                        st.success(
+                            "✅ Admin password set हो गया। अब Login में "
+                            "markam296@gmail.com और नया password इस्तेमाल करें।"
+                        )
+                    else:
+                        st.error(error or "Admin password setup failed.")
 
         if st.button("Continue with Google", use_container_width=True):
             try:
