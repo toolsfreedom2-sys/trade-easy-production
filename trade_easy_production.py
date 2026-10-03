@@ -3588,6 +3588,43 @@ def dashboard(user, workspace):
     paper_user_id = getattr(user, "id", "")
     paper_workspace_id = workspace.get("id") if workspace else "default"
     paper_state = load_paper_state(paper_user_id, paper_workspace_id)
+
+    # ============================================================
+    # PERMANENT PAPER TRADING CONTROL
+    # This control is intentionally outside all live-data fragments and
+    # strategy render roots. It must remain visible at all times, including
+    # market-closed / WAITING / no-FYERS-data states.
+    # ============================================================
+    st.markdown('<div class="section-head">🧹 Paper Trading Controls</div>', unsafe_allow_html=True)
+    reset_col, reset_info = st.columns([1.15, 3.85])
+    with reset_col:
+        if st.button(
+            "🧹 RESET PAPER TRADING",
+            use_container_width=True,
+            type="secondary",
+            key="reset_paper_trading_permanent",
+            help="Reset only paper-trading state: today's trades, P&L, open paper position and audit history. FYERS/live data and strategy settings are unchanged.",
+        ):
+            paper_state["date"] = pd.Timestamp.now(tz="Asia/Kolkata").strftime("%Y-%m-%d")
+            paper_state["daily_realized_pnl"] = 0.0
+            paper_state["trades_today"] = 0
+            paper_state["open_position"] = None
+            paper_state["last_entry_signature"] = None
+            paper_state["trade_history"] = []
+            paper_state["audit_log"] = []
+            paper_state["paper_kill_switch"] = False
+            save_paper_state(paper_user_id, paper_workspace_id, paper_state)
+            st.session_state["paper_reset_notice"] = True
+            st.rerun()
+    with reset_info:
+        st.caption(
+            "Reset केवल Paper Trading को साफ करता है — Live/FYERS data, strategy settings और fixed Qty 65 सुरक्षित रहते हैं। "
+            f"Current: {"OPEN" if paper_state.get("open_position") else "FLAT"} • "
+            f"Trades: {int(paper_state.get("trades_today", 0))} • "
+            f"P&L: ₹{float(paper_state.get("daily_realized_pnl", 0.0)):,.2f}"
+        )
+    if st.session_state.pop("paper_reset_notice", False):
+        st.success("✅ Paper Trading reset हो गया — P&L ₹0, trades 0, open position साफ।")
     # Normalize any legacy/open paper position to the permanent paper quantity.
     if paper_state.get("open_position"):
         paper_state["open_position"]["quantity"] = PAPER_FIXED_QUANTITY
@@ -4295,34 +4332,6 @@ def dashboard(user, workspace):
             s2.metric("Trades Today", str(paper.get("trades_today", 0)))
             s3.metric("Realized P&L", f"₹{float(paper.get('daily_realized_pnl', 0.0)):,.2f}")
             s4.metric("Unrealized P&L", f"₹{float(paper.get('unrealized_pnl', 0.0)):,.2f}")
-
-            # PAPER-ONLY RESET: keep this control inside the permanent Strategy
-            # Dashboard render root so it remains visible even when detailed
-            # strategy output is waiting for/holding market data.
-            reset_col, reset_info = st.columns([1.15, 3.85])
-            with reset_col:
-                if st.button(
-                    "🧹 RESET PAPER TRADING",
-                    use_container_width=True,
-                    type="secondary",
-                    key="reset_paper_day_strategy_cards",
-                    help="Reset only today's paper-trading state: trades, P&L, open paper position and audit history. FYERS/live data and strategy settings are unchanged.",
-                ):
-                    paper["date"] = pd.Timestamp.now(tz="Asia/Kolkata").strftime("%Y-%m-%d")
-                    paper["daily_realized_pnl"] = 0.0
-                    paper["trades_today"] = 0
-                    paper["open_position"] = None
-                    paper["last_entry_signature"] = None
-                    paper["trade_history"] = []
-                    paper["audit_log"] = []
-                    paper["paper_kill_switch"] = False
-                    save_paper_state(paper_user_id, paper_workspace_id, paper)
-                    st.session_state["paper_reset_notice"] = True
-                    st.rerun()
-            with reset_info:
-                st.caption("Reset केवल Paper Trading को साफ करता है — Live/FYERS data, strategy settings और fixed Qty 65 सुरक्षित रहते हैं।")
-            if st.session_state.pop("paper_reset_notice", False):
-                st.success("✅ Paper Trading reset हो गया — P&L ₹0, trades 0, open position साफ।")
 
             st.markdown('<div class="section-head">Phase-3 Monitoring & Audit</div>', unsafe_allow_html=True)
             st.caption("🟢 LOGIC ACTIVE — monitoring/audit remains visible continuously." if not paper.get("paper_kill_switch") else "🔴 LOGIC PAUSED — paper kill switch is active; audit remains visible.")
