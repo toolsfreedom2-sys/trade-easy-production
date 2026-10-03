@@ -66,10 +66,10 @@ def _config_value(name: str, default: str = "") -> str:
     return str(os.environ.get(name, default) or "").strip()
 
 
-SUPABASE_URL = _config_value("SUPABASE_URL")
-SUPABASE_PUBLISHABLE_KEY = _config_value("SUPABASE_PUBLISHABLE_KEY")
-TRADE_EASY_PUBLIC_URL = _config_value("TRADE_EASY_PUBLIC_URL")
-REDIRECT_URL = _config_value("SUPABASE_REDIRECT_URL", TRADE_EASY_PUBLIC_URL)
+SUPABASE_URL = ("https://uuqbjhjzoicnzmiprmee.supabase.co")
+SUPABASE_PUBLISHABLE_KEY = ("sb_publishable_gJmLuOGIPSibBWBpHY3uow_14b9geIj")
+TRADE_EASY_PUBLIC_URL = ("TRADE_EASY_PUBLIC_URL")
+REDIRECT_URL = ("SUPABASE_REDIRECT_URL", TRADE_EASY_PUBLIC_URL)
 
 FYERS_CONFIG_APP_ID = _config_value("FYERS_APP_ID")
 FYERS_CONFIG_SECRET = _config_value("FYERS_SECRET_KEY") or _config_value("FYERS_SECRET_ID")
