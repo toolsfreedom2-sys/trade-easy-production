@@ -67,6 +67,8 @@ def _config_value(name: str, default: str = "") -> str:
 
 SUPABASE_URL = _config_value("SUPABASE_URL")
 SUPABASE_PUBLISHABLE_KEY = _config_value("SUPABASE_PUBLISHABLE_KEY")
+# Server-only Supabase secret key. Never expose this in the UI or GitHub.
+SUPABASE_SECRET_KEY = _config_value("SUPABASE_SECRET_KEY")
 
 TRADE_EASY_PUBLIC_URL = _config_value("TRADE_EASY_PUBLIC_URL")
 
@@ -1322,6 +1324,42 @@ def admin_load_all():
     return profiles, plans, subscriptions, payments
 
 
+def admin_reset_user_password(user_id, new_password):
+    """Reset any user's Supabase Auth password from the server side.
+
+    This uses the Supabase Auth Admin REST endpoint and therefore requires
+    SUPABASE_SECRET_KEY in Streamlit Secrets. The secret is never rendered
+    in the app. Only an authenticated admin can reach the UI that calls this.
+    """
+    if not SUPABASE_SECRET_KEY:
+        return False, "SUPABASE_SECRET_KEY Streamlit Secrets में configured नहीं है।"
+    if not user_id:
+        return False, "User ID missing है।"
+    if not new_password or len(new_password) < 8:
+        return False, "Password कम-से-कम 8 characters का होना चाहिए।"
+    try:
+        endpoint = f"{SUPABASE_URL.rstrip('/')}/auth/v1/admin/users/{user_id}"
+        response = requests.put(
+            endpoint,
+            headers={
+                "apikey": SUPABASE_SECRET_KEY,
+                "Authorization": f"Bearer {SUPABASE_SECRET_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={"password": new_password},
+            timeout=15,
+        )
+        if 200 <= response.status_code < 300:
+            return True, None
+        try:
+            detail = response.json()
+        except Exception:
+            detail = response.text
+        return False, f"Supabase password update failed ({response.status_code}): {detail}"
+    except Exception as exc:
+        return False, f"Password update error: {exc}"
+
+
 def admin_update_profile(user_id, *, role=None, status=None):
     payload = {}
     if role is not None:
@@ -1672,6 +1710,26 @@ def admin_dashboard(user, profile, workspace):
                         st.success("User access updated.") if ok else st.error(err or "Update failed")
                         if ok:
                             st.rerun()
+
+                    st.markdown("#### 🔐 Admin Password Management")
+                    st.caption("Admin यहाँ से किसी selected user का Supabase login password सीधे बदल सकता है। Password केवल server-side Auth Admin API को भेजा जाता है।")
+                    with st.form(f"admin_password_form_{uid}", clear_on_submit=True):
+                        pw1 = st.text_input("New Password", type="password", key=f"admin_pw1_{uid}")
+                        pw2 = st.text_input("Confirm New Password", type="password", key=f"admin_pw2_{uid}")
+                        change_pw = st.form_submit_button("Change Password", use_container_width=True, type="primary")
+                    if change_pw:
+                        if not SUPABASE_SECRET_KEY:
+                            st.error("SUPABASE_SECRET_KEY configured नहीं है। पहले Streamlit Secrets में इसे जोड़ें।")
+                        elif len(pw1) < 8:
+                            st.error("Password कम-से-कम 8 characters का होना चाहिए।")
+                        elif pw1 != pw2:
+                            st.error("दोनों passwords match नहीं कर रहे हैं।")
+                        else:
+                            ok, err = admin_reset_user_password(uid, pw1)
+                            if ok:
+                                st.success(f"✅ Password changed successfully for {current.get('email', 'selected user')}.")
+                            else:
+                                st.error(err or "Password update failed.")
         else:
             st.info("अभी कोई profile नहीं मिली। पहले subscription setup SQL चलाएँ।")
 
@@ -4367,14 +4425,9 @@ def main():
     # the Set New Password screen.
     reset_requested = (
         st.query_params.get("reset_password") == "1"
-        or st.query_params.get("type") == "recovery"
         or bool(st.session_state.get("password_recovery"))
     )
 
-    # Supabase PKCE reset links return a one-time `code` to the redirect URL.
-    # IMPORTANT: do NOT call clear_oauth_params() or st.rerun() here. The
-    # recovery session must remain available in this same Streamlit run so the
-    # Set New Password form can immediately use supabase.auth.update_user().
     if reset_requested and oauth_code and user is None:
         try:
             response = supabase.auth.exchange_code_for_session(
@@ -4382,36 +4435,30 @@ def main():
             )
 
             recovered_user = getattr(response, "user", None)
+
             if recovered_user is not None:
                 user = recovered_user
                 st.session_state["password_recovery"] = True
-            else:
-                user = get_current_user()
-                if user is not None:
-                    st.session_state["password_recovery"] = True
+                clear_oauth_params()
+                st.rerun()
 
-            if user is None:
-                st.error(
-                    "Password reset link की session नहीं बन सकी। "
-                    "Link expire हो सकता है या पहले ही इस्तेमाल हो चुका है।"
-                )
-                st.stop()
+            user = get_current_user()
+            if user is not None:
+                st.session_state["password_recovery"] = True
+                clear_oauth_params()
+                st.rerun()
 
-        except Exception as e:
+            clear_oauth_params()
             st.error(
-                "Password reset callback error: "
-                f"{type(e).__name__}: {e}"
+                "Password reset session नहीं बन सकी। "
+                "Reset link दोबारा भेजें।"
             )
             st.stop()
 
-    # If a recovery callback was opened without a usable authenticated session,
-    # show a recovery-specific error instead of silently sending the user to the
-    # normal Login screen.
-    if reset_requested and st.session_state.get("password_recovery") and user is None:
-        st.error(
-            "Password reset session उपलब्ध नहीं है। कृपया नया reset link request करें।"
-        )
-        st.stop()
+        except Exception as e:
+            clear_oauth_params()
+            st.error(f"Password reset callback error: {e}")
+            st.stop()
 
     # ------------------------------------------------------------
     # NORMAL GOOGLE OAUTH CALLBACK
@@ -4447,10 +4494,10 @@ def main():
 
     if st.session_state.get("password_recovery"):
         if user is None:
-            st.error(
-                "Password reset session उपलब्ध नहीं है। कृपया नया reset link request करें।"
-            )
-            st.stop()
+            clear_oauth_params()
+            st.session_state.pop("password_recovery", None)
+            login_page()
+            return
 
         st.markdown("## 🔐 Set New Password")
         st.info("आपका password reset link सही है। नया password सेट करें।")
