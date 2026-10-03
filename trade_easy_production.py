@@ -68,15 +68,17 @@ def _config_value(name: str, default: str = "") -> str:
 
 SUPABASE_URL = _config_value("https://uuqbjhjzoicnzmiprmee.supabase.co")
 SUPABASE_PUBLISHABLE_KEY = _config_value("sb_publishable_gJmLuOGIPSibBWBpHY3uow_14b9geIj")
+
 TRADE_EASY_PUBLIC_URL = _config_value("https://tradeeasy.streamlit.app")
-REDIRECT_URL = _config_value("https://tradeeasy.streamlit.app/)
+REDIRECT_URL = _config_value("https://tradeeasy.streamlit.app/"L)
 
 FYERS_CONFIG_APP_ID = _config_value("K20QNFRUC0-100")
-FYERS_CONFIG_SECRET = _config_value("08VGJF3CU4")
+FYERS_CONFIG_SECRET = _config_value("08VGJF3CU4") or _config_value("08VGJF3CU4")
 FYERS_REDIRECT_URI = _config_value("https://tradeeasy.streamlit.app/")
+
 if not FYERS_REDIRECT_URI and TRADE_EASY_PUBLIC_URL:
     FYERS_REDIRECT_URI = TRADE_EASY_PUBLIC_URL.rstrip("/") + "/"
-
+    
 if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
     raise RuntimeError(
         "Production configuration missing: set SUPABASE_URL and "
