@@ -2088,49 +2088,68 @@ def login_page():
 
         st.divider()
 
-        with st.expander("🔐 First-time Admin Password Setup"):
+        with st.expander("🔐 First-time Admin Password Setup", expanded=True):
             st.caption(
                 "यह केवल configured first-admin account के लिए है। "
                 "Admin Dashboard में जाने की जरूरत नहीं है।"
             )
-            admin_email = st.text_input(
-                "Admin Email",
-                value=TRADE_EASY_ADMIN_EMAIL,
-                key="bootstrap_admin_email",
-            )
-            admin_token = st.text_input(
-                "Admin Bootstrap Token",
-                type="password",
-                key="bootstrap_admin_token",
-                help="यह token केवल Streamlit Secrets में configured होना चाहिए।",
-            )
-            admin_new_password = st.text_input(
-                "New Admin Password",
-                type="password",
-                key="bootstrap_admin_new_password",
-            )
-            admin_confirm_password = st.text_input(
-                "Confirm Admin Password",
-                type="password",
-                key="bootstrap_admin_confirm_password",
-            )
 
-            if st.button(
-                "Set Admin Password",
-                type="primary",
-                use_container_width=True,
-                key="bootstrap_admin_password_btn",
-            ):
-                if admin_new_password != admin_confirm_password:
-                    st.error("दोनों passwords match नहीं कर रहे हैं।")
+            # Use a form so Streamlit submits all three password fields together.
+            # Passwords are normalized with Unicode NFC only; whitespace is preserved.
+            with st.form("first_admin_bootstrap_form", clear_on_submit=False):
+                admin_email = st.text_input(
+                    "Admin Email",
+                    value=TRADE_EASY_ADMIN_EMAIL,
+                    key="bootstrap_admin_email_v2",
+                )
+                admin_token = st.text_input(
+                    "Admin Bootstrap Token",
+                    type="password",
+                    key="bootstrap_admin_token_v2",
+                    help="यह token केवल Streamlit Secrets में configured होना चाहिए।",
+                )
+                admin_new_password = st.text_input(
+                    "New Admin Password",
+                    type="password",
+                    key="bootstrap_admin_new_password_v2",
+                    help="कम-से-कम 8 characters. इसे कहीं extra space के साथ न लिखें।",
+                )
+                admin_confirm_password = st.text_input(
+                    "Confirm Admin Password",
+                    type="password",
+                    key="bootstrap_admin_confirm_password_v2",
+                    help="ऊपर वाले password को बिल्कुल वही दोबारा लिखें।",
+                )
+
+                bootstrap_submit = st.form_submit_button(
+                    "Set Admin Password",
+                    type="primary",
+                    use_container_width=True,
+                )
+
+            if bootstrap_submit:
+                # NFC normalization prevents visually identical Unicode passwords
+                # from failing comparison because of different Unicode composition.
+                p1 = unicodedata.normalize("NFC", str(admin_new_password or ""))
+                p2 = unicodedata.normalize("NFC", str(admin_confirm_password or ""))
+
+                if not p1 or not p2:
+                    st.error("New Admin Password और Confirm Admin Password दोनों भरें।")
+                elif p1 != p2:
+                    st.error(
+                        f"दोनों passwords match नहीं कर रहे हैं। "
+                        f"पहले field में {len(p1)} characters और "
+                        f"दूसरे में {len(p2)} characters हैं। "
+                        "दोनों fields manually एक जैसा password लिखें।"
+                    )
                 else:
                     ok, error = admin_bootstrap_admin_password(
-                        admin_email, admin_token, admin_new_password
+                        admin_email, admin_token, p1
                     )
                     if ok:
                         st.success(
                             "✅ Admin password set हो गया। अब Login में "
-                            "markam296@gmail.com और नया password इस्तेमाल करें।"
+                            "markam296@gmail.com और यही नया password इस्तेमाल करें।"
                         )
                     else:
                         st.error(error or "Admin password setup failed.")
