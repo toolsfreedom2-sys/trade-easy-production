@@ -2814,8 +2814,6 @@ def login_page():
                         except Exception as e:
                             st.error(f"Password reset error: {e}")
 
-            
-
         with signup_tab:
             name = st.text_input("Name", key="signup_name", placeholder="Your name")
             email = st.text_input("Email", key="signup_email", placeholder="you@example.com")
