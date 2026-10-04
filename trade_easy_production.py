@@ -5915,7 +5915,36 @@ def main():
         st.session_state.pop("trade_easy_subscription", None)
         st.markdown("## 🔒 Account Blocked")
         st.error("आपका Trade Easy account administrator द्वारा block किया गया है।")
-        st.info("Dashboard access अभी उपलब्ध नहीं है। कृपया administrator से संपर्क करें।")
+        st.info("Dashboard access अभी उपलब्ध नहीं है। अगर आपको लगता है कि यह गलती से हुआ है, तो Support से संपर्क करें।")
+
+        # Blocked-user support: the user must still have a clear way to
+        # contact the administrator even though dashboard access is denied.
+        support_phone_display = "9165464323"
+        support_phone_intl = "919165464323"
+        support_email = "markam1markam@gmail.com"
+        support_message = (
+            "Hello Trade Easy Support, my account is blocked. "
+            f"My registered email is {getattr(user, 'email', '') or 'not available'}. "
+            "Please help me review/unblock my account."
+        )
+        from urllib.parse import quote
+        whatsapp_url = f"https://wa.me/{support_phone_intl}?text={quote(support_message)}"
+        call_url = f"tel:+91{support_phone_display}"
+        email_url = (
+            f"mailto:{support_email}?subject={quote('Trade Easy Account Blocked - Support Request')}"
+            f"&body={quote(support_message)}"
+        )
+
+        st.markdown("### 📞 Contact Support")
+        st.caption(f"Support: +91 {support_phone_display} • {support_email}")
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.link_button("💬 WhatsApp Support", whatsapp_url, use_container_width=True)
+        with c2:
+            st.link_button("📞 Call Support", call_url, use_container_width=True)
+        with c3:
+            st.link_button("✉️ Email Support", email_url, use_container_width=True)
+
         try:
             supabase.auth.sign_out()
         except Exception:
