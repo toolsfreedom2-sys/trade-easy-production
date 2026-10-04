@@ -9,6 +9,7 @@ import time
 import webbrowser
 import threading
 import re
+import tempfile
 import unicodedata
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -79,6 +80,8 @@ TRADE_EASY_ADMIN_EMAIL = _config_value("TRADE_EASY_ADMIN_EMAIL", "markam296@gmai
 TRADE_EASY_ADMIN_BOOTSTRAP_TOKEN = _config_value("TRADE_EASY_ADMIN_BOOTSTRAP_TOKEN")
 
 TRADE_EASY_PUBLIC_URL = _config_value("TRADE_EASY_PUBLIC_URL")
+# Google Web OAuth Client ID for Google Identity Services popup/One Tap.
+GOOGLE_CLIENT_ID = _config_value("GOOGLE_CLIENT_ID")
 
 REDIRECT_URL = _config_value(
     "SUPABASE_REDIRECT_URL",
@@ -101,7 +104,12 @@ if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
 if not TRADE_EASY_PUBLIC_URL:
     st.warning(
         "TRADE_EASY_PUBLIC_URL is not configured. Set it to the deployed "
-        "https://*.streamlit.app URL before using Google/FYERS OAuth."
+        "https://*.streamlit.app URL before using password recovery/FYERS."
+    )
+if not GOOGLE_CLIENT_ID:
+    st.warning(
+        "GOOGLE_CLIENT_ID is not configured. Add the Google Web OAuth Client ID "
+        "from Google Cloud to Streamlit Secrets for Google Sign-In."
     )
 
 
@@ -2625,6 +2633,93 @@ drop policy if exists payments_admin_write on public.payments;
 create policy payments_admin_write on public.payments for all to authenticated using (public.trade_easy_is_admin()) with check (public.trade_easy_is_admin());
 """
 
+
+# ============================================================
+# GOOGLE IDENTITY SERVICES AUTH
+# Uses Google's pre-built Sign in with Google button/One Tap and
+# exchanges the returned Google ID token directly with Supabase Auth.
+# This avoids the redirect-based Google OAuth page that is currently
+# returning a Google 403 in this deployment.
+# ============================================================
+
+def render_google_gsi(button_key="login"):
+    """Render a Google Identity Services button as a local Streamlit component."""
+    if not GOOGLE_CLIENT_ID:
+        st.warning("Google Login के लिए Streamlit Secrets में GOOGLE_CLIENT_ID सेट करें।")
+        return None
+
+    nonce_key = f"google_raw_nonce_{button_key}"
+    raw_nonce = st.session_state.get(nonce_key)
+    if not raw_nonce:
+        raw_nonce = base64.urlsafe_b64encode(os.urandom(32)).decode("ascii").rstrip("=")
+        st.session_state[nonce_key] = raw_nonce
+    hashed_nonce = sha256(raw_nonce.encode("utf-8")).hexdigest()
+
+    root = Path(tempfile.gettempdir()) / f"trade_easy_google_gsi_{button_key}"
+    root.mkdir(parents=True, exist_ok=True)
+    html_file = root / "index.html"
+    html = """<!doctype html>
+<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<script src="https://accounts.google.com/gsi/client" async defer></script>
+<style>html,body{margin:0;padding:0;background:transparent;font-family:Arial,sans-serif;}#google-btn{display:flex;justify-content:center;min-height:44px;}#msg{font-size:12px;color:#b42318;text-align:center;margin-top:5px;}</style>
+</head><body><div id="google-btn"></div><div id="msg"></div>
+<script>
+(function(){
+ function sv(v){window.parent.postMessage({isStreamlitMessage:true,type:'streamlit:setComponentValue',value:v,dataType:'json'},'*');}
+ function sh(h){window.parent.postMessage({isStreamlitMessage:true,type:'streamlit:setFrameHeight',height:h},'*');}
+ function boot(){
+   if(!window.google||!google.accounts||!google.accounts.id){setTimeout(boot,250);return;}
+   google.accounts.id.initialize({
+     client_id:__CLIENT_ID__,
+     callback:function(r){if(r&&r.credential){sv({credential:r.credential});}else{document.getElementById('msg').textContent='Google credential नहीं मिला।';}},
+     nonce:__NONCE__,
+     auto_select:false,
+     cancel_on_tap_outside:true,
+     use_fedcm_for_prompt:true
+   });
+   google.accounts.id.renderButton(document.getElementById('google-btn'),{type:'standard',theme:'outline',size:'large',text:'continue_with',shape:'rectangular',logo_alignment:'left',width:360});
+   sh(52);
+ }
+ boot();
+})();
+</script></body></html>"""
+    html = html.replace("__CLIENT_ID__", json.dumps(GOOGLE_CLIENT_ID)).replace("__NONCE__", json.dumps(hashed_nonce))
+    if not html_file.exists() or html_file.read_text(encoding="utf-8") != html:
+        html_file.write_text(html, encoding="utf-8")
+
+    component = components.declare_component(f"trade_easy_google_gsi_{button_key}", path=str(root))
+    return component(key=f"google_gsi_{button_key}", default=None)
+
+
+def handle_google_gsi_result(result, button_key="login"):
+    """Exchange a one-time Google GSI credential for a Supabase session."""
+    if not result or not isinstance(result, dict):
+        return False
+    token = str(result.get("credential") or "").strip()
+    if not token:
+        return False
+
+    token_hash = sha256(token.encode("utf-8")).hexdigest()
+    if st.session_state.get(f"google_processed_{button_key}") == token_hash:
+        return False
+    st.session_state[f"google_processed_{button_key}"] = token_hash
+
+    raw_nonce = st.session_state.get(f"google_raw_nonce_{button_key}")
+    credentials = {"provider": "google", "token": token}
+    if raw_nonce:
+        credentials["nonce"] = raw_nonce
+
+    try:
+        response = supabase.auth.sign_in_with_id_token(credentials)
+        if getattr(response, "user", None) is not None:
+            return True
+        st.error("Google authentication succeeded, लेकिन Supabase session नहीं बनी।")
+        return False
+    except Exception as exc:
+        st.error(f"Google Sign-In error: {type(exc).__name__}: {exc}")
+        return False
+
+
 def login_page():
     """Compact centered popup-style authentication screen."""
     st.markdown("""
@@ -2756,7 +2851,7 @@ def login_page():
                 except Exception as e:
                     st.error(f"Login error: {e}")
 
-            forgot_left, forgot_col, forgot_right = st.columns([1, 12, 1])
+            forgot_left, forgot_col, forgot_right = st.columns([1, 1.35, 1])
             with forgot_col:
                 if st.button("Forgot Password?", use_container_width=True, key="forgot_password_btn"):
                     if not email.strip():
@@ -2772,27 +2867,20 @@ def login_page():
                         except Exception as e:
                             st.error(f"Password reset error: {e}")
 
-            if st.button("Continue with Google", use_container_width=True, key="google_login_btn"):
-                try:
-                    response = supabase.auth.sign_in_with_oauth(
-                        {"provider": "google", "options": {"redirect_to": REDIRECT_URL}}
-                    )
-                    url = getattr(response, "url", None)
-                    if url:
-                        st.markdown(
-                            f'<meta http-equiv="refresh" content="0; url={url}">',
-                            unsafe_allow_html=True,
-                        )
-                        st.info("Google Login खोल रहा है...")
-                    else:
-                        st.error("Google OAuth URL नहीं मिला।")
-                except Exception as e:
-                    st.error(f"Google login error: {e}")
+            google_result = render_google_gsi("login")
+            if handle_google_gsi_result(google_result, "login"):
+                st.success("Google Login successful")
+                st.rerun()
 
         with signup_tab:
             name = st.text_input("Name", key="signup_name", placeholder="Your name")
             email = st.text_input("Email", key="signup_email", placeholder="you@example.com")
             password = st.text_input("Password", type="password", key="signup_password", placeholder="Create a password")
+
+            google_signup_result = render_google_gsi("signup")
+            if handle_google_gsi_result(google_signup_result, "signup"):
+                st.success("Google account created / login successful")
+                st.rerun()
 
             if st.button("Create Account", use_container_width=True, type="primary", key="signup_btn"):
                 try:
