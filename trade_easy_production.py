@@ -2063,6 +2063,63 @@ def admin_bootstrap_admin_password(email, bootstrap_token, new_password):
         return False, f"Admin bootstrap error: {exc}"
 
 
+def admin_delete_user(user_id):
+    """Permanently delete a non-admin user from Supabase Auth.
+
+    This is intentionally server-side and refuses to delete admin accounts.
+    Supabase Auth deletion is used as the source-of-truth removal operation;
+    tables with ON DELETE CASCADE (including subscription_requests) are then
+    cleaned automatically by the database.
+    """
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        return False, "User ID missing है।"
+
+    try:
+        admin_client = get_supabase_admin()
+
+        # Never allow an admin account to be removed from this console.
+        profile_rows = (
+            admin_client.table("profiles")
+            .select("id,email,role")
+            .eq("id", user_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if not profile_rows:
+            return False, "User profile नहीं मिली।"
+
+        target = profile_rows[0]
+        if str(target.get("role") or "user").lower() == "admin":
+            return False, "Security के लिए admin account को Delete User से delete नहीं किया जा सकता।"
+
+        response = admin_client.auth.admin.delete_user(user_id)
+
+        # Different supabase-py versions return different response shapes.
+        # If the call did not raise, treat it as successful; verify that the
+        # application profile is gone when possible.
+        verify = (
+            admin_client.table("profiles")
+            .select("id")
+            .eq("id", user_id)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+        if verify:
+            return False, (
+                "Supabase Auth user delete हो गया/प्रोसेस हुआ, लेकिन profile अभी भी मौजूद है। "
+                "Database में profiles.id -> auth.users(id) पर ON DELETE CASCADE जाँचें।"
+            )
+
+        return True, f"User {target.get('email') or user_id} permanently deleted."
+    except Exception as exc:
+        return False, f"User delete failed: {exc}"
+
+
 def admin_update_profile(user_id, *, role=None, status=None):
     """Update a user's access using the trusted server-side Supabase client.
 
@@ -2452,6 +2509,33 @@ def admin_dashboard(user, profile, workspace):
                         st.success("User access updated.") if ok else st.error(err or "Update failed")
                         if ok:
                             st.rerun()
+
+                    # Permanent deletion is deliberately separated from the
+                    # normal access controls to prevent accidental deletion.
+                    if str(current.get("role") or "user").lower() != "admin":
+                        st.markdown("#### 🗑️ Delete User")
+                        st.warning(
+                            "यह permanent action है। User का Supabase Auth account और उससे जुड़े "
+                            "ON DELETE CASCADE records हट सकते हैं। इसे केवल तब करें जब account को "
+                            "वास्तव में पूरी तरह हटाना हो।"
+                        )
+                        confirm_delete = st.checkbox(
+                            "मैं इस user account को permanently delete करना चाहता हूँ।",
+                            key=f"confirm_delete_{uid}",
+                        )
+                        if st.button(
+                            "🗑️ Permanently Delete User",
+                            key=f"delete_user_{uid}",
+                            use_container_width=True,
+                            disabled=not confirm_delete,
+                        ):
+                            ok, err = admin_delete_user(uid)
+                            if ok:
+                                st.success(err or "User permanently deleted.")
+                                st.session_state.pop("admin_selected_user", None)
+                                st.rerun()
+                            else:
+                                st.error(err or "User delete failed.")
 
                     st.markdown("#### 🔐 Admin Password Management")
                     st.caption("Admin यहाँ से किसी selected user का Supabase login password सीधे बदल सकता है। Password केवल server-side Auth Admin API को भेजा जाता है।")
