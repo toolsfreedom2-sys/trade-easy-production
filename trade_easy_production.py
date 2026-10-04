@@ -1729,7 +1729,21 @@ def admin_load_all():
         sub, plan = _normalize_subscription_row(raw)
         subscriptions.append(sub)
     payments = _admin_rows("payments", "id,user_id,subscription_id,amount,currency,payment_gateway,payment_id,status,paid_at,created_at")
-    requests = _admin_rows("subscription_requests", "id,user_id,plan_id,plan_name,amount,duration_days,phone,status,payment_link,payment_reference,notes,created_at,updated_at")
+    # subscription_requests is intentionally protected with RLS and has no
+    # normal-user SELECT policy. Read it with the server-only Supabase Admin
+    # client so pending requests are visible in the Admin Console.
+    try:
+        requests = (
+            get_supabase_admin()
+            .table("subscription_requests")
+            .select("id,user_id,plan_id,plan_name,amount,duration_days,phone,status,payment_link,payment_reference,notes,created_at,updated_at")
+            .order("created_at", desc=True)
+            .execute()
+            .data
+            or []
+        )
+    except Exception:
+        requests = []
     return profiles, plans, subscriptions, payments, requests
 
 
