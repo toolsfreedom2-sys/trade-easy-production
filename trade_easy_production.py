@@ -9,7 +9,6 @@ import time
 import webbrowser
 import threading
 import re
-import tempfile
 import unicodedata
 from pathlib import Path
 from urllib.parse import quote_plus
@@ -21,7 +20,6 @@ import pandas as pd
 import numpy as np
 import requests
 import streamlit as st
-import streamlit.components.v1 as components
 from supabase import create_client, Client
 
 try:
@@ -2642,10 +2640,132 @@ create policy payments_admin_write on public.payments for all to authenticated u
 # returning a Google 403 in this deployment.
 # ============================================================
 
-def render_google_gsi(button_key="login"):
-    """Render a Google Identity Services button as a local Streamlit component."""
+# Streamlit's V2 custom-component API keeps the Google button entirely in the
+# deployed Python app; no temp frontend directory or extra static assets are
+# required. This avoids Community Cloud component-asset loading failures.
+_GOOGLE_GSI_COMPONENT = None
+
+
+def _get_google_gsi_component():
+    global _GOOGLE_GSI_COMPONENT
+    if _GOOGLE_GSI_COMPONENT is not None:
+        return _GOOGLE_GSI_COMPONENT
+
+    # V2 is available in current Streamlit releases and supports inline
+    # HTML/JS plus frontend->Python trigger values.
+    components_v2 = getattr(getattr(st, "components", None), "v2", None)
+    if components_v2 is None or not hasattr(components_v2, "component"):
+        return None
+
+    html = """
+    <div class="te-google-root">
+      <div class="te-google-button"></div>
+      <div class="te-google-msg"></div>
+    </div>
+    """
+
+    js = """
+    export default function(component) {
+      const {data, parentElement, setTriggerValue} = component;
+      const root = parentElement.querySelector('.te-google-root');
+      const button = root ? root.querySelector('.te-google-button') : null;
+      const msg = root ? root.querySelector('.te-google-msg') : null;
+      if (!root || !button) return;
+
+      const clientId = data && data.client_id ? data.client_id : '';
+      const nonce = data && data.nonce ? data.nonce : '';
+      const width = Math.max(240, Math.min(360, Number(data && data.width) || 320));
+
+      if (!clientId) {
+        if (msg) msg.textContent = 'Google Client ID configured नहीं है।';
+        return;
+      }
+
+      const render = () => {
+        if (!window.google || !window.google.accounts || !window.google.accounts.id) {
+          setTimeout(render, 150);
+          return;
+        }
+        if (button.dataset.ready === '1') return;
+
+        try {
+          window.google.accounts.id.initialize({
+            client_id: clientId,
+            callback: (response) => {
+              if (response && response.credential) {
+                setTriggerValue('credential', response.credential);
+              } else if (msg) {
+                msg.textContent = 'Google credential नहीं मिला।';
+              }
+            },
+            nonce: nonce,
+            auto_select: false,
+            cancel_on_tap_outside: true,
+            use_fedcm_for_prompt: true
+          });
+
+          window.google.accounts.id.renderButton(button, {
+            type: 'standard',
+            theme: 'outline',
+            size: 'large',
+            text: 'continue_with',
+            shape: 'rectangular',
+            logo_alignment: 'left',
+            width: width
+          });
+          button.dataset.ready = '1';
+          if (msg) msg.textContent = '';
+        } catch (e) {
+          if (msg) msg.textContent = 'Google button load error: ' + (e && e.message ? e.message : e);
+        }
+      };
+
+      if (window.google && window.google.accounts && window.google.accounts.id) {
+        render();
+      } else if (!document.querySelector('script[data-trade-easy-google-gsi="1"]')) {
+        const script = document.createElement('script');
+        script.src = 'https://accounts.google.com/gsi/client';
+        script.async = true;
+        script.defer = true;
+        script.dataset.tradeEasyGoogleGsi = '1';
+        script.onload = render;
+        script.onerror = () => {
+          if (msg) msg.textContent = 'Google Sign-In library load नहीं हो सकी।';
+        };
+        document.head.appendChild(script);
+      } else {
+        render();
+      }
+    }
+    """
+
+    css = """
+    .te-google-root { width: 100%; text-align: center; }
+    .te-google-button { display: flex; justify-content: center; min-height: 44px; }
+    .te-google-msg { color: #b42318; font-size: 12px; min-height: 16px; margin-top: 4px; }
+    """
+
+    _GOOGLE_GSI_COMPONENT = components_v2.component(
+        "trade_easy_google_gsi_inline",
+        html=html,
+        css=css,
+        js=js,
+    )
+    return _GOOGLE_GSI_COMPONENT
+
+
+def render_google_gsi(button_key="main"):
+    """Render an inline Google Identity Services button without external component assets."""
     if not GOOGLE_CLIENT_ID:
         st.warning("Google Login के लिए Streamlit Secrets में GOOGLE_CLIENT_ID सेट करें।")
+        return None
+
+    comp = _get_google_gsi_component()
+    if comp is None:
+        st.error(
+            "इस Streamlit runtime में Custom Components V2 उपलब्ध नहीं है। "
+            "Google Sign-In button load नहीं किया जा सकता। Streamlit version update करें।"
+        )
         return None
 
     nonce_key = f"google_raw_nonce_{button_key}"
@@ -2653,49 +2773,37 @@ def render_google_gsi(button_key="login"):
     if not raw_nonce:
         raw_nonce = base64.urlsafe_b64encode(os.urandom(32)).decode("ascii").rstrip("=")
         st.session_state[nonce_key] = raw_nonce
-    hashed_nonce = sha256(raw_nonce.encode("utf-8")).hexdigest()
 
-    root = Path(tempfile.gettempdir()) / f"trade_easy_google_gsi_{button_key}"
-    root.mkdir(parents=True, exist_ok=True)
-    html_file = root / "index.html"
-    html = """<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<script src="https://accounts.google.com/gsi/client" async defer></script>
-<style>html,body{margin:0;padding:0;background:transparent;font-family:Arial,sans-serif;}#google-btn{display:flex;justify-content:center;min-height:44px;}#msg{font-size:12px;color:#b42318;text-align:center;margin-top:5px;}</style>
-</head><body><div id="google-btn"></div><div id="msg"></div>
-<script>
-(function(){
- function sv(v){window.parent.postMessage({isStreamlitMessage:true,type:'streamlit:setComponentValue',value:v,dataType:'json'},'*');}
- function sh(h){window.parent.postMessage({isStreamlitMessage:true,type:'streamlit:setFrameHeight',height:h},'*');}
- function boot(){
-   if(!window.google||!google.accounts||!google.accounts.id){setTimeout(boot,250);return;}
-   google.accounts.id.initialize({
-     client_id:__CLIENT_ID__,
-     callback:function(r){if(r&&r.credential){sv({credential:r.credential});}else{document.getElementById('msg').textContent='Google credential नहीं मिला।';}},
-     nonce:__NONCE__,
-     auto_select:false,
-     cancel_on_tap_outside:true,
-     use_fedcm_for_prompt:true
-   });
-   google.accounts.id.renderButton(document.getElementById('google-btn'),{type:'standard',theme:'outline',size:'large',text:'continue_with',shape:'rectangular',logo_alignment:'left',width:360});
-   sh(52);
- }
- boot();
-})();
-</script></body></html>"""
-    html = html.replace("__CLIENT_ID__", json.dumps(GOOGLE_CLIENT_ID)).replace("__NONCE__", json.dumps(hashed_nonce))
-    if not html_file.exists() or html_file.read_text(encoding="utf-8") != html:
-        html_file.write_text(html, encoding="utf-8")
-
-    component = components.declare_component(f"trade_easy_google_gsi_{button_key}", path=str(root))
-    return component(key=f"google_gsi_{button_key}", default=None)
+    result = comp(
+        data={
+            "client_id": GOOGLE_CLIENT_ID,
+            "nonce": sha256(raw_nonce.encode("utf-8")).hexdigest(),
+            "width": 320,
+        },
+        key=f"google_gsi_{button_key}",
+        on_credential_change=lambda: None,
+        default={"credential": None},
+    )
+    return result
 
 
-def handle_google_gsi_result(result, button_key="login"):
+def _google_result_credential(result):
+    if result is None:
+        return ""
+    try:
+        value = getattr(result, "credential", None)
+        if value:
+            return str(value).strip()
+    except Exception:
+        pass
+    if isinstance(result, dict):
+        return str(result.get("credential") or "").strip()
+    return ""
+
+
+def handle_google_gsi_result(result, button_key="main"):
     """Exchange a one-time Google GSI credential for a Supabase session."""
-    if not result or not isinstance(result, dict):
-        return False
-    token = str(result.get("credential") or "").strip()
+    token = _google_result_credential(result)
     if not token:
         return False
 
@@ -2718,7 +2826,6 @@ def handle_google_gsi_result(result, button_key="login"):
     except Exception as exc:
         st.error(f"Google Sign-In error: {type(exc).__name__}: {exc}")
         return False
-
 
 def login_page():
     """Compact centered popup-style authentication screen."""
@@ -2867,20 +2974,12 @@ def login_page():
                         except Exception as e:
                             st.error(f"Password reset error: {e}")
 
-            google_result = render_google_gsi("login")
-            if handle_google_gsi_result(google_result, "login"):
-                st.success("Google Login successful")
-                st.rerun()
 
         with signup_tab:
             name = st.text_input("Name", key="signup_name", placeholder="Your name")
             email = st.text_input("Email", key="signup_email", placeholder="you@example.com")
             password = st.text_input("Password", type="password", key="signup_password", placeholder="Create a password")
 
-            google_signup_result = render_google_gsi("signup")
-            if handle_google_gsi_result(google_signup_result, "signup"):
-                st.success("Google account created / login successful")
-                st.rerun()
 
             if st.button("Create Account", use_container_width=True, type="primary", key="signup_btn"):
                 try:
@@ -2909,7 +3008,16 @@ def login_page():
                 except Exception as e:
                     st.error(f"Signup error: {e}")
 
-        st.markdown('<div class="te-auth-caption">Secure authentication • Trade Easy</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div style="text-align:center;color:#64748b;font-size:11px;margin:10px 0 6px;">or continue with Google</div>',
+            unsafe_allow_html=True,
+        )
+        google_result = render_google_gsi("main")
+        if handle_google_gsi_result(google_result, "main"):
+            st.success("Google sign-in successful")
+            st.rerun()
+
+        st.markdown('<div class="te-auth-caption">Google से नया user account बने तो वही 7-day Free Trial लागू होगा.</div>', unsafe_allow_html=True)
 
 
 # ============================================================
