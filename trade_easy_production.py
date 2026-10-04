@@ -4219,7 +4219,7 @@ def dashboard(user, workspace):
             current_trades = int(paper_state.get("trades_today", 0))
             current_pnl = float(paper_state.get("daily_realized_pnl", 0.0))
             st.caption(
-                "Reset केवल Paper Trading को साफ करता है — Live/FYERS data, strategy settings और fixed Qty 65 सुरक्षित रहते हैं। "
+                ""
                 f"Current: {current_position} • Trades: {current_trades} • P&L: ₹{current_pnl:,.2f}"
             )
         if st.session_state.pop("paper_reset_notice", False):
