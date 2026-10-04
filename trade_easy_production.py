@@ -1396,11 +1396,31 @@ def fyers_ltp_feed(access_token, app_id, symbol):
 # ============================================================
 
 def get_current_user():
+    """Return the active Supabase user using both user and session APIs.
+
+    Streamlit can rerun immediately after authentication. Some supabase-py
+    versions briefly expose the authenticated identity via get_session() before
+    get_user() sees it, so we try both paths.
+    """
     try:
         response = supabase.auth.get_user()
-        return getattr(response, "user", None)
+        user = getattr(response, "user", None)
+        if user is not None:
+            return user
     except Exception:
-        return None
+        pass
+    try:
+        session = supabase.auth.get_session()
+        user = getattr(session, "user", None)
+        if user is not None:
+            return user
+        sess = getattr(session, "session", None)
+        user = getattr(sess, "user", None) if sess is not None else None
+        if user is not None:
+            return user
+    except Exception:
+        pass
+    return None
 
 
 def clear_oauth_params():
@@ -2819,7 +2839,10 @@ def handle_google_gsi_result(result, button_key="main"):
 
     try:
         response = supabase.auth.sign_in_with_id_token(credentials)
-        if getattr(response, "user", None) is not None:
+        signed_user = getattr(response, "user", None)
+        if signed_user is not None:
+            st.session_state["trade_easy_google_user_id"] = str(getattr(signed_user, "id", ""))
+            st.session_state["trade_easy_google_user_email"] = str(getattr(signed_user, "email", "") or "")
             return True
         st.error("Google authentication succeeded, लेकिन Supabase session नहीं बनी।")
         return False
@@ -2829,196 +2852,201 @@ def handle_google_gsi_result(result, button_key="main"):
 
 def login_page():
     """Compact centered popup-style authentication screen."""
-    st.markdown("""
-    <style>
-    /* Compact popup: logo and form live in the same visual card. */
-    .stApp {
-        background:
-            radial-gradient(circle at 15% 18%, rgba(38,99,235,.20), transparent 30%),
-            radial-gradient(circle at 85% 18%, rgba(139,92,246,.16), transparent 28%),
-            linear-gradient(135deg,#050b16 0%,#0a1222 48%,#060b14 100%);
-    }
-    [data-testid="stHeader"] { background: transparent; }
-    [data-testid="stToolbar"] { display:none; }
-
-    /* The authentication row itself becomes the popup. */
-    .stApp .stHorizontalBlock {
-        max-width: 520px !important;
-        margin: 7vh auto 0 auto !important;
-        align-items: stretch !important;
-    }
-    .stApp .stHorizontalBlock > div[data-testid="column"] {
-        display: none;
-    }
-    .stApp .stHorizontalBlock > div[data-testid="column"]:nth-child(2) {
-        display: block !important;
-        flex: 0 0 100% !important;
-        width: 100% !important;
-        max-width: 100% !important;
-        padding: 24px 34px 24px !important;
-        border-radius: 22px !important;
-        background: rgba(12,20,35,.92) !important;
-        border: 1px solid rgba(148,163,184,.20) !important;
-        box-shadow: 0 24px 80px rgba(0,0,0,.48), inset 0 1px 0 rgba(255,255,255,.05) !important;
-        backdrop-filter: blur(18px);
-        box-sizing: border-box !important;
-    }
-
-    .te-auth-brand { text-align:center; margin:0 0 12px 0; }
-    .te-auth-logo {
-        width:52px;height:52px;margin:0 auto 7px;border-radius:15px;
-        display:flex;align-items:center;justify-content:center;
-        font-size:25px;font-weight:900;
-        background:linear-gradient(135deg,#2563eb,#7c3aed);
-        color:#fff;box-shadow:0 9px 25px rgba(37,99,235,.25);
-    }
-    .te-auth-title { color:#f8fafc;font-size:24px;font-weight:850;line-height:1.05;letter-spacing:-.4px; }
-    .te-auth-sub { color:#94a3b8;font-size:11px;margin-top:4px; }
-
-    div[data-testid="stTabs"] { margin-top: 2px !important; }
-    div[data-testid="stTabs"] button { font-size:13px !important; font-weight:700 !important; }
-    div[data-testid="stTabsContent"] { padding-top: 10px !important; }
-
-    /* White input boxes with dark text for clear typing. */
-    div[data-testid="stTextInput"] { margin-bottom: 7px !important; }
-    div[data-testid="stTextInput"] label {
-        color:#cbd5e1 !important;
-        font-size:12px !important;
-        font-weight:600 !important;
-        margin-bottom:3px !important;
-    }
-    div[data-testid="stTextInput"] input,
-    div[data-testid="stTextInput"] input:focus {
-        background:#ffffff !important;
-        color:#111827 !important;
-        -webkit-text-fill-color:#111827 !important;
-        caret-color:#111827 !important;
-        border:1px solid #cbd5e1 !important;
-        border-radius:10px !important;
-        box-shadow:none !important;
-        min-height:40px !important;
-    }
-    div[data-testid="stTextInput"] input::placeholder {
-        color:#6b7280 !important;
-        opacity:1 !important;
-    }
-    div[data-testid="stTextInput"] input:focus {
-        border-color:#64748b !important;
-        box-shadow:0 0 0 2px rgba(59,130,246,.14) !important;
-    }
-
-    div.stButton { margin-top:7px !important; }
-    div.stButton > button {
-        border-radius:10px !important;
-        min-height:40px !important;
-        font-weight:700 !important;
-    }
-    .te-auth-caption {
-        color:#64748b;font-size:10px;text-align:center;margin-top:10px;
-    }
-
-    @media (max-width: 640px) {
-        .stApp .stHorizontalBlock {
-            max-width: calc(100% - 24px) !important;
-            margin-top: 4vh !important;
-        }
-        .stApp .stHorizontalBlock > div[data-testid="column"]:nth-child(2) {
-            padding:20px 18px 18px !important;
-        }
-    }
-    </style>
-    """, unsafe_allow_html=True)
-
-    left, center, right = st.columns([1.15, 1.7, 1.15])
-    with center:
+    login_shell = st.container(key="te_login_shell")
+    with login_shell:
         st.markdown("""
-        <div class="te-auth-brand">
-          <div class="te-auth-logo">TE</div>
-          <div class="te-auth-title">Trade Easy</div>
-          <div class="te-auth-sub">Index Trading Confirmation &amp; Risk Control</div>
-        </div>
+        <style>
+        /* Compact popup: logo and form live in the same visual card. */
+        .stApp {
+            background:
+                radial-gradient(circle at 15% 18%, rgba(38,99,235,.20), transparent 30%),
+                radial-gradient(circle at 85% 18%, rgba(139,92,246,.16), transparent 28%),
+                linear-gradient(135deg,#050b16 0%,#0a1222 48%,#060b14 100%);
+        }
+        [data-testid="stHeader"] { background: transparent; }
+        [data-testid="stToolbar"] { display:none; }
+
+        /* Login-only popup styling. Scoped to te_login_shell so dashboard columns
+           remain fully visible after authentication. */
+        .st-key-te_login_shell .stHorizontalBlock {
+            max-width: 520px !important;
+            margin: 7vh auto 0 auto !important;
+            align-items: stretch !important;
+        }
+        .st-key-te_login_shell .stHorizontalBlock > div[data-testid="column"] {
+            display: none !important;
+        }
+        .st-key-te_login_shell .stHorizontalBlock > div[data-testid="column"]:nth-child(2) {
+            display: block !important;
+            flex: 0 0 100% !important;
+            width: 100% !important;
+            max-width: 100% !important;
+            padding: 24px 34px 24px !important;
+            border-radius: 22px !important;
+            background: rgba(12,20,35,.92) !important;
+            border: 1px solid rgba(148,163,184,.20) !important;
+            box-shadow: 0 24px 80px rgba(0,0,0,.48), inset 0 1px 0 rgba(255,255,255,.05) !important;
+            backdrop-filter: blur(18px);
+            box-sizing: border-box !important;
+        }
+
+        .te-auth-brand { text-align:center; margin:0 0 12px 0; }
+        .te-auth-logo {
+            width:52px;height:52px;margin:0 auto 7px;border-radius:15px;
+            display:flex;align-items:center;justify-content:center;
+            font-size:25px;font-weight:900;
+            background:linear-gradient(135deg,#2563eb,#7c3aed);
+            color:#fff;box-shadow:0 9px 25px rgba(37,99,235,.25);
+        }
+        .te-auth-title { color:#f8fafc;font-size:24px;font-weight:850;line-height:1.05;letter-spacing:-.4px; }
+        .te-auth-sub { color:#94a3b8;font-size:11px;margin-top:4px; }
+
+        div[data-testid="stTabs"] { margin-top: 2px !important; }
+        div[data-testid="stTabs"] button { font-size:13px !important; font-weight:700 !important; }
+        div[data-testid="stTabsContent"] { padding-top: 10px !important; }
+
+        /* White input boxes with dark text for clear typing. */
+        div[data-testid="stTextInput"] { margin-bottom: 7px !important; }
+        div[data-testid="stTextInput"] label {
+            color:#cbd5e1 !important;
+            font-size:12px !important;
+            font-weight:600 !important;
+            margin-bottom:3px !important;
+        }
+        div[data-testid="stTextInput"] input,
+        div[data-testid="stTextInput"] input:focus {
+            background:#ffffff !important;
+            color:#111827 !important;
+            -webkit-text-fill-color:#111827 !important;
+            caret-color:#111827 !important;
+            border:1px solid #cbd5e1 !important;
+            border-radius:10px !important;
+            box-shadow:none !important;
+            min-height:40px !important;
+        }
+        div[data-testid="stTextInput"] input::placeholder {
+            color:#6b7280 !important;
+            opacity:1 !important;
+        }
+        div[data-testid="stTextInput"] input:focus {
+            border-color:#64748b !important;
+            box-shadow:0 0 0 2px rgba(59,130,246,.14) !important;
+        }
+
+        div.stButton { margin-top:7px !important; }
+        div.stButton > button {
+            border-radius:10px !important;
+            min-height:40px !important;
+            font-weight:700 !important;
+        }
+        .te-auth-caption {
+            color:#64748b;font-size:10px;text-align:center;margin-top:10px;
+        }
+
+        @media (max-width: 640px) {
+            .st-key-te_login_shell .stHorizontalBlock {
+                max-width: calc(100% - 24px) !important;
+                margin-top: 4vh !important;
+            }
+            .st-key-te_login_shell .stHorizontalBlock > div[data-testid="column"]:nth-child(2) {
+                padding:20px 18px 18px !important;
+            }
+        }
+        </style>
         """, unsafe_allow_html=True)
 
-        login_tab, signup_tab = st.tabs(["🔐 Login", "🆕 Create Account"])
+        left, center, right = st.columns([1.15, 1.7, 1.15])
+        with center:
+            st.markdown("""
+            <div class="te-auth-brand">
+              <div class="te-auth-logo">TE</div>
+              <div class="te-auth-title">Trade Easy</div>
+              <div class="te-auth-sub">Index Trading Confirmation &amp; Risk Control</div>
+            </div>
+            """, unsafe_allow_html=True)
 
-        with login_tab:
-            email = st.text_input("Email", key="login_email", placeholder="you@example.com")
-            password = st.text_input("Password", type="password", key="login_password", placeholder="Enter your password")
+            login_tab, signup_tab = st.tabs(["🔐 Login", "🆕 Create Account"])
 
-            if st.button("Login", use_container_width=True, type="primary", key="login_btn"):
-                try:
-                    result = supabase.auth.sign_in_with_password(
-                        {"email": email.strip(), "password": password}
-                    )
-                    if getattr(result, "user", None):
-                        st.success("Login successful")
-                        st.rerun()
-                    else:
-                        st.error("Login failed.")
-                except Exception as e:
-                    st.error(f"Login error: {e}")
+            with login_tab:
+                email = st.text_input("Email", key="login_email", placeholder="you@example.com")
+                password = st.text_input("Password", type="password", key="login_password", placeholder="Enter your password")
 
-            forgot_left, forgot_col, forgot_right = st.columns([1, 1.35, 1])
-            with forgot_col:
-                if st.button("Forgot Password?", use_container_width=True, key="forgot_password_btn"):
-                    if not email.strip():
-                        st.warning("पहले अपना email address डालें।")
-                    else:
-                        try:
-                            password_reset_url = f"{TRADE_EASY_PUBLIC_URL.rstrip('/')}/?reset_password=1"
-                            supabase.auth.reset_password_for_email(
-                                email.strip(),
-                                {"redirect_to": password_reset_url},
-                            )
-                            st.success("Password reset link भेज दिया गया है। Email खोलें और नया password सेट करें।")
-                        except Exception as e:
-                            st.error(f"Password reset error: {e}")
+                if st.button("Login", use_container_width=True, type="primary", key="login_btn"):
+                    try:
+                        result = supabase.auth.sign_in_with_password(
+                            {"email": email.strip(), "password": password}
+                        )
+                        if getattr(result, "user", None):
+                            signed_user = getattr(result, "user", None)
+                            st.session_state["trade_easy_login_user_id"] = str(getattr(signed_user, "id", ""))
+                            st.session_state["trade_easy_login_user_email"] = str(getattr(signed_user, "email", "") or "")
+                            st.success("Login successful")
+                            st.rerun()
+                        else:
+                            st.error("Login failed.")
+                    except Exception as e:
+                        st.error(f"Login error: {e}")
+
+                forgot_left, forgot_col, forgot_right = st.columns([1, 1.35, 1])
+                with forgot_col:
+                    if st.button("Forgot Password?", use_container_width=True, key="forgot_password_btn"):
+                        if not email.strip():
+                            st.warning("पहले अपना email address डालें।")
+                        else:
+                            try:
+                                password_reset_url = f"{TRADE_EASY_PUBLIC_URL.rstrip('/')}/?reset_password=1"
+                                supabase.auth.reset_password_for_email(
+                                    email.strip(),
+                                    {"redirect_to": password_reset_url},
+                                )
+                                st.success("Password reset link भेज दिया गया है। Email खोलें और नया password सेट करें।")
+                            except Exception as e:
+                                st.error(f"Password reset error: {e}")
 
 
-        with signup_tab:
-            name = st.text_input("Name", key="signup_name", placeholder="Your name")
-            email = st.text_input("Email", key="signup_email", placeholder="you@example.com")
-            password = st.text_input("Password", type="password", key="signup_password", placeholder="Create a password")
+            with signup_tab:
+                name = st.text_input("Name", key="signup_name", placeholder="Your name")
+                email = st.text_input("Email", key="signup_email", placeholder="you@example.com")
+                password = st.text_input("Password", type="password", key="signup_password", placeholder="Create a password")
 
 
-            if st.button("Create Account", use_container_width=True, type="primary", key="signup_btn"):
-                try:
-                    result = supabase.auth.sign_up(
-                        {
-                            "email": email.strip(),
-                            "password": password,
-                            "options": {
-                                "data": {
-                                    "display_name": name.strip(),
-                                    "full_name": name.strip(),
-                                }
-                            },
-                        }
-                    )
-                    new_user = getattr(result, "user", None)
-                    if new_user:
-                        # Start the one-time 7-day trial as soon as the account is created.
-                        try:
-                            ensure_trial_subscription(getattr(new_user, "id", ""))
-                        except Exception:
-                            pass
-                        st.success("Account created. आपका 7-day Free Trial शुरू हो गया है। अगर email confirmation enabled है तो पहले email confirm करें।")
-                    else:
-                        st.error("Account creation failed.")
-                except Exception as e:
-                    st.error(f"Signup error: {e}")
+                if st.button("Create Account", use_container_width=True, type="primary", key="signup_btn"):
+                    try:
+                        result = supabase.auth.sign_up(
+                            {
+                                "email": email.strip(),
+                                "password": password,
+                                "options": {
+                                    "data": {
+                                        "display_name": name.strip(),
+                                        "full_name": name.strip(),
+                                    }
+                                },
+                            }
+                        )
+                        new_user = getattr(result, "user", None)
+                        if new_user:
+                            # Start the one-time 7-day trial as soon as the account is created.
+                            try:
+                                ensure_trial_subscription(getattr(new_user, "id", ""))
+                            except Exception:
+                                pass
+                            st.success("Account created. आपका 7-day Free Trial शुरू हो गया है। अगर email confirmation enabled है तो पहले email confirm करें।")
+                        else:
+                            st.error("Account creation failed.")
+                    except Exception as e:
+                        st.error(f"Signup error: {e}")
 
-        st.markdown(
-            '<div style="text-align:center;color:#64748b;font-size:11px;margin:10px 0 6px;">or continue with Google</div>',
-            unsafe_allow_html=True,
-        )
-        google_result = render_google_gsi("main")
-        if handle_google_gsi_result(google_result, "main"):
-            st.success("Google sign-in successful")
-            st.rerun()
+            st.markdown(
+                '<div style="text-align:center;color:#64748b;font-size:11px;margin:10px 0 6px;">or continue with Google</div>',
+                unsafe_allow_html=True,
+            )
+            google_result = render_google_gsi("main")
+            if handle_google_gsi_result(google_result, "main"):
+                st.success("Google sign-in successful")
+                st.rerun()
 
-        st.markdown('<div class="te-auth-caption">Google से नया user account बने तो वही 7-day Free Trial लागू होगा.</div>', unsafe_allow_html=True)
-
+            st.markdown('<div class="te-auth-caption">Google से नया user account बने तो वही 7-day Free Trial लागू होगा.</div>', unsafe_allow_html=True)
 
 # ============================================================
 # DATA LAYER
@@ -4020,6 +4048,21 @@ def dashboard(user, workspace):
     st.markdown("""
     <style>
     /* ========================================================
+       TRADE EASY — DASHBOARD RESET
+       Explicitly undo any login-only column rules that may remain in the
+       browser DOM for one rerun after authentication.
+       ======================================================== */
+    .stApp .stHorizontalBlock {
+        max-width: 100% !important;
+        margin-left: 0 !important;
+        margin-right: 0 !important;
+    }
+    .stApp .stHorizontalBlock > div[data-testid="column"] {
+        display: block !important;
+        max-width: none !important;
+    }
+
+    /* ========================================================
        TRADE EASY — VISUAL CLARITY LAYER
        UI only: no trading/data logic is changed here.
        ======================================================== */
@@ -4860,8 +4903,8 @@ def dashboard(user, workspace):
             st.session_state["fyers_app_id"] = active_app_id
     
         if not active_app_id:
-            st.info("Live market connection is currently unavailable. Last available dashboard data is retained.")
-            st.stop()
+            st.session_state["trade_easy_strategy_error"] = "FYERS App ID not configured; dashboard is running in display-only mode."
+            return
     
         # Completed-candle history changes only when the selected timeframe closes.
         # During market close, a single cached snapshot is enough.
@@ -5616,12 +5659,17 @@ def dashboard(user, workspace):
     
 
     # Invisible strategy polling fragment: it writes to strategy_root only when
-    # a new confirmed strategy or paper-trade event is detected.
-    if hasattr(st, "fragment"):
-        _render_full_dashboard = st.fragment(
-            run_every="1s", key="trade_easy_strategy_dashboard"
-        )(_render_full_dashboard)
-    _render_full_dashboard()
+    # a new confirmed strategy or paper-trade event is detected. A runtime/version
+    # mismatch must never prevent the static dashboard from opening.
+    try:
+        if hasattr(st, "fragment"):
+            _render_full_dashboard = st.fragment(
+                run_every="1s", key="trade_easy_strategy_dashboard"
+            )(_render_full_dashboard)
+        _render_full_dashboard()
+    except Exception as exc:
+        st.session_state["trade_easy_strategy_error"] = f"Live dashboard refresh: {type(exc).__name__}: {exc}"
+        st.warning("Dashboard खुल गया है; live strategy refresh अभी उपलब्ध नहीं है।")
 
 # ============================================================
 # PASSWORD RECOVERY: DEFAULT SUPABASE EMAIL (NO CUSTOM SMTP)
@@ -6066,7 +6114,12 @@ def main():
         subscription_block_page(subscription, user)
         return
 
-    dashboard(user, workspace)
+    try:
+        dashboard(user, workspace)
+    except Exception as exc:
+        st.error("Dashboard render में error आया, लेकिन login session सही है।")
+        st.code(f"{type(exc).__name__}: {exc}")
+        st.info("Dashboard का static हिस्सा सुरक्षित रखने के लिए live/optional section को अलग किया गया है।")
 
 
 if __name__ == "__main__":
