@@ -20,6 +20,7 @@ import pandas as pd
 import numpy as np
 import requests
 import streamlit as st
+import streamlit.components.v1 as components
 from supabase import create_client, Client
 
 try:
@@ -79,6 +80,10 @@ TRADE_EASY_ADMIN_BOOTSTRAP_TOKEN = _config_value("TRADE_EASY_ADMIN_BOOTSTRAP_TOK
 
 TRADE_EASY_PUBLIC_URL = _config_value("TRADE_EASY_PUBLIC_URL")
 
+REDIRECT_URL = _config_value(
+    "SUPABASE_REDIRECT_URL",
+    TRADE_EASY_PUBLIC_URL
+)
 
 FYERS_CONFIG_APP_ID = _config_value("FYERS_APP_ID")
 FYERS_CONFIG_SECRET = _config_value("FYERS_SECRET_ID")
@@ -96,7 +101,7 @@ if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
 if not TRADE_EASY_PUBLIC_URL:
     st.warning(
         "TRADE_EASY_PUBLIC_URL is not configured. Set it to the deployed "
-        "https://*.streamlit.app URL before using password recovery/FYERS OAuth."
+        "https://*.streamlit.app URL before using Google/FYERS OAuth."
     )
 
 
@@ -2059,19 +2064,61 @@ def admin_bootstrap_admin_password(email, bootstrap_token, new_password):
 
 
 def admin_update_profile(user_id, *, role=None, status=None):
+    """Update a user's access using the trusted server-side Supabase client.
+
+    Access-control changes must never depend on the normal user's RLS session.
+    In particular, setting profiles.status='blocked' must reliably persist even
+    when the target user's own session is still active.
+    """
     payload = {}
     if role is not None:
         payload["role"] = str(role).lower()
     if status is not None:
-        payload["status"] = str(status).lower()
+        status_value = str(status).lower().strip()
+        if status_value not in {"active", "blocked"}:
+            return False, "Invalid account status."
+        payload["status"] = status_value
     if not payload:
         return False, "कोई बदलाव नहीं।"
+
+    user_id = str(user_id or "").strip()
+    if not user_id:
+        return False, "User ID missing है।"
+
     payload["updated_at"] = _utc_now().isoformat()
     try:
-        result = supabase.table("profiles").update(payload).eq("id", user_id).execute()
-        return bool(result.data), None if result.data else "Profile update नहीं हुआ।"
+        admin_client = get_supabase_admin()
+        result = (
+            admin_client.table("profiles")
+            .update(payload)
+            .eq("id", user_id)
+            .execute()
+        )
+        rows = result.data or []
+        if not rows:
+            return False, "Profile update नहीं हुआ। User profile नहीं मिली।"
+
+        # Read-after-write verification: never report success unless the
+        # database actually contains the requested access state.
+        if status is not None:
+            verify = (
+                admin_client.table("profiles")
+                .select("id,status,role")
+                .eq("id", user_id)
+                .limit(1)
+                .execute()
+                .data
+                or []
+            )
+            if not verify:
+                return False, "Profile update के बाद verification failed।"
+            actual_status = str(verify[0].get("status") or "").lower()
+            if actual_status != str(status).lower():
+                return False, f"Account status save नहीं हुआ। Database status: {actual_status or 'unknown'}"
+
+        return True, None
     except Exception as exc:
-        return False, str(exc)
+        return False, f"Profile access update failed: {exc}"
 
 
 def admin_create_plan(name, price, duration_days, features, is_active=True):
@@ -2751,7 +2798,7 @@ def login_page():
                 except Exception as e:
                     st.error(f"Login error: {e}")
 
-            forgot_left, forgot_col, forgot_right = st.columns([1, 16, 1])
+            forgot_left, forgot_col, forgot_right = st.columns([1, 1.35, 1])
             with forgot_col:
                 if st.button("Forgot Password?", use_container_width=True, key="forgot_password_btn"):
                     if not email.strip():
@@ -2767,6 +2814,22 @@ def login_page():
                         except Exception as e:
                             st.error(f"Password reset error: {e}")
 
+            if st.button("Continue with Google", use_container_width=True, key="google_login_btn"):
+                try:
+                    response = supabase.auth.sign_in_with_oauth(
+                        {"provider": "google", "options": {"redirect_to": REDIRECT_URL}}
+                    )
+                    url = getattr(response, "url", None)
+                    if url:
+                        st.markdown(
+                            f'<meta http-equiv="refresh" content="0; url={url}">',
+                            unsafe_allow_html=True,
+                        )
+                        st.info("Google Login खोल रहा है...")
+                    else:
+                        st.error("Google OAuth URL नहीं मिला।")
+                except Exception as e:
+                    st.error(f"Google login error: {e}")
 
         with signup_tab:
             name = st.text_input("Name", key="signup_name", placeholder="Your name")
@@ -5630,14 +5693,17 @@ def main():
 
     if oauth_error:
         clear_oauth_params()
-        st.error(f"Authentication failed: {oauth_error_description or oauth_error}")
+        st.error(f"Google login failed: {oauth_error_description or oauth_error}")
         st.stop()
 
     # ------------------------------------------------------------
     # PASSWORD RECOVERY CALLBACK
     # ------------------------------------------------------------
-    # IMPORTANT: Handle the password-reset callback before any generic OAuth
-    # handling so the user is returned to the Set New Password screen.
+    # IMPORTANT: Handle the password-reset callback BEFORE the normal
+    # Google OAuth callback. Supabase sends the reset code back to the
+    # deployed app; if the generic oauth_code block consumes it first,
+    # the user is returned to the normal Login page instead of seeing
+    # the Set New Password screen.
     reset_requested = (
         st.query_params.get("reset_password") == "1"
         or str(recovery_type or "").lower() == "recovery"
@@ -5735,8 +5801,37 @@ def main():
             st.error(f"Password reset callback error: {type(e).__name__}: {e}")
             st.stop()
 
-    # No normal OAuth provider callback is handled here.
-    # `oauth_code` remains reserved for the password-recovery PKCE flow above.
+    # ------------------------------------------------------------
+    # NORMAL GOOGLE OAUTH CALLBACK
+    # ------------------------------------------------------------
+    if oauth_code and user is None and not reset_requested:
+        try:
+            response = supabase.auth.exchange_code_for_session(
+                {"auth_code": oauth_code}
+            )
+
+            if getattr(response, "user", None) is not None:
+                clear_oauth_params()
+                st.rerun()
+
+            user = get_current_user()
+            if user is not None:
+                clear_oauth_params()
+                st.rerun()
+
+            clear_oauth_params()
+            st.error("Google login completed, but session was not found.")
+            st.stop()
+
+        except Exception as e:
+            user_after_error = get_current_user()
+            if user_after_error is not None:
+                clear_oauth_params()
+                st.rerun()
+
+            clear_oauth_params()
+            st.error(f"Google login callback error: {e}")
+            st.stop()
 
     if st.session_state.get("password_recovery"):
         if user is None:
@@ -5805,6 +5900,29 @@ def main():
         st.code(profile_error or "Unknown profile error")
         st.info("Admin Console → Setup में दिया गया subscription setup SQL एक बार run करें।")
         st.stop()
+
+    # ------------------------------------------------------------
+    # ACCOUNT ACCESS GATE
+    # ------------------------------------------------------------
+    # This check intentionally happens BEFORE both subscription access and the
+    # admin bypass. A blocked account must never reach the trading dashboard.
+    # The profile is fetched on every Streamlit rerun, so a block applied by an
+    # admin takes effect on the user's next interaction/refresh even if the user
+    # already had a valid subscription/session.
+    account_status = str(profile.get("status") or "active").strip().lower()
+    if account_status == "blocked":
+        st.session_state["trade_easy_account_blocked"] = True
+        st.session_state.pop("trade_easy_subscription", None)
+        st.markdown("## 🔒 Account Blocked")
+        st.error("आपका Trade Easy account administrator द्वारा block किया गया है।")
+        st.info("Dashboard access अभी उपलब्ध नहीं है। कृपया administrator से संपर्क करें।")
+        try:
+            supabase.auth.sign_out()
+        except Exception:
+            pass
+        st.stop()
+
+    st.session_state["trade_easy_account_blocked"] = False
 
     # Admins bypass subscription gating so they can always manage users/plans.
     if is_admin_profile(profile):
