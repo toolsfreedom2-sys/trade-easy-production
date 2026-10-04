@@ -2814,22 +2814,7 @@ def login_page():
                         except Exception as e:
                             st.error(f"Password reset error: {e}")
 
-            if st.button("Continue with Google", use_container_width=True, key="google_login_btn"):
-                try:
-                    response = supabase.auth.sign_in_with_oauth(
-                        {"provider": "google", "options": {"redirect_to": REDIRECT_URL}}
-                    )
-                    url = getattr(response, "url", None)
-                    if url:
-                        st.markdown(
-                            f'<meta http-equiv="refresh" content="0; url={url}">',
-                            unsafe_allow_html=True,
-                        )
-                        st.info("Google Login खोल रहा है...")
-                    else:
-                        st.error("Google OAuth URL नहीं मिला।")
-                except Exception as e:
-                    st.error(f"Google login error: {e}")
+            
 
         with signup_tab:
             name = st.text_input("Name", key="signup_name", placeholder="Your name")
