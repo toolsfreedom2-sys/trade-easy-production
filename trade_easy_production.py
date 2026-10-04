@@ -3838,7 +3838,7 @@ def dashboard(user, workspace):
     def _render_strategy_placeholder():
         with strategy_root.container():
             st.markdown('<div class="section-head">Trade Easy Strategy Dashboard</div>', unsafe_allow_html=True)
-            st.caption("Dashboard हमेशा visible रहेगा • live/completed-candle values उपलब्ध होने पर इसी section में भरेंगी")
+            
             q1, q2, q3, q4, q5 = st.columns(5)
             q1.metric("Last Signal", "WAITING")
             q2.metric("Direction", "—")
