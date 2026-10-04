@@ -3802,7 +3802,7 @@ def dashboard(user, workspace):
     c1, c2 = st.columns([5, 1])
     with c1:
         st.title("Trade Easy — Index Trading Confirmation")
-        st.caption("PDF specification based confirmation + risk-control dashboard")
+        
     with c2:
         if st.button("Logout", use_container_width=True):
             try:
