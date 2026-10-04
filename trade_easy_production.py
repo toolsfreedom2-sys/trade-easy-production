@@ -8,8 +8,10 @@ import uuid
 import time
 import webbrowser
 import threading
+import re
 import unicodedata
 from pathlib import Path
+from urllib.parse import quote_plus
 from hashlib import sha256
 from collections import deque
 from datetime import datetime, timezone, timedelta
@@ -101,6 +103,8 @@ if not TRADE_EASY_PUBLIC_URL:
         "TRADE_EASY_PUBLIC_URL is not configured. Set it to the deployed "
         "https://*.streamlit.app URL before using Google/FYERS OAuth."
     )
+
+
 @st.cache_resource
 def get_supabase() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY)
@@ -1454,14 +1458,13 @@ def get_or_create_workspace(user):
 
 # ============================================================
 # ADMIN + SUBSCRIPTION SYSTEM
-# Uses Supabase tables protected by RLS. No payment gateway is assumed here;
-# payments can be recorded manually or connected later through webhooks.
+# New accounts receive a 7-day trial. Paid plans are requested manually:
+# user selects a plan and mobile number, admin sends a payment link externally,
+# and admin activates the subscription after payment confirmation.
 # ============================================================
 
-SUBSCRIPTION_ENFORCEMENT = str(
-    os.environ.get("TRADE_EASY_SUBSCRIPTION_ENFORCEMENT", "true")
-).strip().lower() not in {"0", "false", "no", "off"}
-DEFAULT_TRIAL_DAYS = max(1, int(os.environ.get("TRADE_EASY_TRIAL_DAYS", "7")))
+SUBSCRIPTION_ENFORCEMENT = True
+DEFAULT_TRIAL_DAYS = 7
 
 
 def _utc_now():
@@ -1639,22 +1642,62 @@ def get_user_subscription(user_id):
         return {"error": str(exc), "subscription": None, "plan": None, "status": "SETUP_ERROR"}
 
 
-def ensure_trial_subscription(user_id):
-    """Create a 7-day Free Trial through the SECURITY DEFINER RPC."""
+def _ensure_default_trial_plan():
+    """Ensure the 7-day Free Trial plan exists and is active."""
     try:
-        result = supabase.rpc("ensure_trade_easy_trial", {}).execute()
-        if result.data:
-            return get_user_subscription(user_id)
+        admin_client = get_supabase_admin()
+        rows = (admin_client.table("plans").select("id,name,price,duration_days,features,is_active,created_at")
+                .ilike("name", "Free Trial").limit(1).execute().data or [])
+        if rows:
+            plan = rows[0]
+            if not plan.get("is_active") or int(plan.get("duration_days") or 0) != DEFAULT_TRIAL_DAYS:
+                updated = (admin_client.table("plans").update({
+                    "price": 0, "duration_days": DEFAULT_TRIAL_DAYS,
+                    "features": {"live_price": True, "option_chain": True, "strategy": True, "paper_trading": True},
+                    "is_active": True, "updated_at": _utc_now().isoformat(),
+                }).eq("id", plan.get("id")).execute().data or [])
+                if updated:
+                    plan = updated[0]
+            return plan
+        created = (admin_client.table("plans").insert({
+            "name": "Free Trial", "price": 0, "duration_days": DEFAULT_TRIAL_DAYS,
+            "features": {"live_price": True, "option_chain": True, "strategy": True, "paper_trading": True},
+            "is_active": True,
+        }).execute().data or [])
+        return created[0] if created else None
     except Exception:
-        pass
-    return get_user_subscription(user_id)
+        return None
+
+
+def ensure_trial_subscription(user_id):
+    """Create a one-time 7-day trial for a user who has never had a subscription."""
+    current = get_user_subscription(user_id)
+    if current and current.get("subscription"):
+        return current
+    try:
+        admin_client = get_supabase_admin()
+        plan = _ensure_default_trial_plan()
+        if not plan:
+            return {"status": "SETUP_ERROR", "subscription": None, "plan": None, "error": "Free Trial plan could not be created."}
+        now = _utc_now()
+        end = now + timedelta(days=DEFAULT_TRIAL_DAYS)
+        result = (admin_client.table("subscriptions").insert({
+            "user_id": str(user_id), "plan": "FREE", "provider": "TRIAL", "status": "TRIAL",
+            "starts_at": now.isoformat(), "ends_at": end.isoformat(),
+            "notes": f"Automatic {DEFAULT_TRIAL_DAYS}-day first-account trial", "updated_at": now.isoformat(),
+        }).execute().data or [])
+        if not result:
+            return {"status": "SETUP_ERROR", "subscription": None, "plan": None, "error": "Trial subscription create failed."}
+        return get_user_subscription(user_id) or {"status": "TRIAL", "subscription": result[0], "plan": plan}
+    except Exception as exc:
+        return {"status": "SETUP_ERROR", "subscription": None, "plan": None, "error": str(exc)}
 
 
 def subscription_access_state(user_id):
     """Return whether a normal user may access the trading dashboard."""
-    if not SUBSCRIPTION_ENFORCEMENT:
-        return True, {"status": "LEGACY_ACCESS", "subscription": None, "plan": None}
-    data = ensure_trial_subscription(user_id)
+    data = get_user_subscription(user_id)
+    if not data or not data.get("subscription"):
+        data = ensure_trial_subscription(user_id)
     status = str((data or {}).get("status") or "SETUP_ERROR").upper()
     return status in {"ACTIVE", "TRIAL"}, data
 
@@ -1686,7 +1729,8 @@ def admin_load_all():
         sub, plan = _normalize_subscription_row(raw)
         subscriptions.append(sub)
     payments = _admin_rows("payments", "id,user_id,subscription_id,amount,currency,payment_gateway,payment_id,status,paid_at,created_at")
-    return profiles, plans, subscriptions, payments
+    requests = _admin_rows("subscription_requests", "id,user_id,plan_id,plan_name,amount,duration_days,phone,status,payment_link,payment_reference,notes,created_at,updated_at")
+    return profiles, plans, subscriptions, payments, requests
 
 
 @st.cache_resource
@@ -1708,7 +1752,176 @@ def get_supabase_admin() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
 
 
+
+def _normalize_phone(phone):
+    raw = str(phone or "").strip()
+    digits = re.sub(r"\D", "", raw)
+    if digits.startswith("91") and len(digits) == 12:
+        digits = digits[2:]
+    if len(digits) == 10:
+        return "+91" + digits
+    if 10 <= len(digits) <= 15:
+        return "+" + digits
+    return ""
+
+
+def _phone_display(phone):
+    return _normalize_phone(phone) or "—"
+
+
+def get_user_subscription_request(user_id):
+    try:
+        rows = (get_supabase_admin().table("subscription_requests")
+                .select("id,user_id,plan_id,plan_name,amount,duration_days,phone,status,payment_link,payment_reference,notes,created_at,updated_at")
+                .eq("user_id", str(user_id)).order("created_at", desc=True).limit(10).execute().data or [])
+        for row in rows:
+            if str(row.get("status") or "").upper() in {"PENDING", "LINK_SENT", "PAID"}:
+                return row
+        return rows[0] if rows else None
+    except Exception:
+        return None
+
+
+def create_subscription_request(user, plan, phone, notes=""):
+    if not user or not getattr(user, "id", None):
+        return False, None, "Login session उपलब्ध नहीं है।"
+    normalized = _normalize_phone(phone)
+    if not normalized:
+        return False, None, "सही 10-digit mobile number दर्ज करें।"
+    if not plan or float(plan.get("price") or 0) <= 0:
+        return False, None, "Paid plan नहीं मिला।"
+    try:
+        admin_client = get_supabase_admin()
+        existing = get_user_subscription_request(user.id)
+        now = _utc_now().isoformat()
+        payload = {"user_id": str(user.id), "plan_id": str(plan.get("id") or ""),
+                   "plan_name": str(plan.get("name") or "Subscription"), "amount": float(plan.get("price") or 0),
+                   "duration_days": int(plan.get("duration_days") or 30), "phone": normalized,
+                   "status": "PENDING", "payment_link": None, "payment_reference": None,
+                   "notes": str(notes or "").strip() or None, "updated_at": now}
+        if existing and str(existing.get("status") or "").upper() in {"PENDING", "LINK_SENT", "PAID"}:
+            result = (admin_client.table("subscription_requests").update(payload).eq("id", existing.get("id")).execute().data or [])
+            return True, (result[0] if result else existing), None
+        payload["created_at"] = now
+        result = admin_client.table("subscription_requests").insert(payload).execute().data or []
+        return (True, result[0], None) if result else (False, None, "Subscription request save नहीं हुआ।")
+    except Exception as exc:
+        return False, None, str(exc)
+
+
+def admin_update_subscription_request(request_id, *, status=None, payment_link=None, payment_reference=None, notes=None):
+    payload = {"updated_at": _utc_now().isoformat()}
+    if status is not None:
+        payload["status"] = str(status).upper()
+    if payment_link is not None:
+        payload["payment_link"] = str(payment_link).strip() or None
+    if payment_reference is not None:
+        payload["payment_reference"] = str(payment_reference).strip() or None
+    if notes is not None:
+        payload["notes"] = str(notes).strip() or None
+    try:
+        result = (get_supabase_admin().table("subscription_requests").update(payload).eq("id", str(request_id)).execute().data or [])
+        return bool(result), None if result else "Request update नहीं हुआ।"
+    except Exception as exc:
+        return False, str(exc)
+
+
+def admin_activate_subscription_request(request_row, payment_reference="", notes=""):
+    if not request_row:
+        return False, "Subscription request नहीं मिला।"
+    try:
+        admin_client = get_supabase_admin()
+        user_id = str(request_row.get("user_id") or "")
+        plan_id = str(request_row.get("plan_id") or "")
+        profile_rows = (admin_client.table("profiles").select("id,email,full_name,status").eq("id", user_id).limit(1).execute().data or [])
+        if not profile_rows:
+            return False, "User profile नहीं मिला।"
+        email = str(profile_rows[0].get("email") or "").strip().lower()
+        if not email or not plan_id:
+            return False, "User email/plan information अधूरी है।"
+        ok, message = admin_grant_subscription(email, plan_id, days_override=int(request_row.get("duration_days") or 0) or None,
+            notes=notes or f"Manual payment confirmed for request {request_row.get('id')}",
+            payment_id=payment_reference or request_row.get("payment_reference") or None)
+        if not ok:
+            return False, message or "Subscription activation failed."
+        updated = (admin_client.table("subscription_requests").update({
+            "status": "ACTIVATED", "payment_reference": payment_reference or request_row.get("payment_reference") or None,
+            "notes": notes or request_row.get("notes") or None, "updated_at": _utc_now().isoformat(),
+        }).eq("id", str(request_row.get("id"))).execute().data or [])
+        return (True, message or "Subscription activated.") if updated else (False, "Subscription active हुआ, लेकिन request status update नहीं हुआ।")
+    except Exception as exc:
+        return False, str(exc)
+
+
+def _whatsapp_url(phone, plan_name, payment_link=""):
+    digits = re.sub(r"\D", "", str(phone or ""))
+    if len(digits) == 10:
+        digits = "91" + digits
+    text = f"Trade Easy {plan_name} subscription payment link: {payment_link}" if payment_link else f"Trade Easy {plan_name} subscription payment link"
+    return f"https://wa.me/{digits}?text={quote_plus(text)}"
+
+
+def _paid_subscription_plans():
+    try:
+        rows = (supabase.table("plans").select("id,name,price,duration_days,features,is_active,created_at")
+                .eq("is_active", True).order("price").execute().data or [])
+        return [p for p in rows if float(p.get("price") or 0) > 0]
+    except Exception:
+        return []
+
+
+def subscription_request_page(user, data=None, allow_back=False):
+    if allow_back and st.button("← Back to Dashboard", key="back_from_subscription_request", use_container_width=True):
+        st.session_state["show_subscription_request"] = False
+        st.rerun()
+    st.markdown("## 💳 Choose Subscription Plan")
+    current = get_user_subscription_request(getattr(user, "id", ""))
+    if current:
+        status = str(current.get("status") or "PENDING").upper()
+        if status == "PENDING":
+            st.info("आपका request admin के पास पहुँच गया है। Admin payment link आपके mobile पर भेजेगा।")
+        elif status == "LINK_SENT":
+            st.warning("Admin ने payment link भेज दिया है। Payment के बाद admin account activate करेगा।")
+        elif status == "PAID":
+            st.info("Payment confirmation मिल चुका है। Admin activation pending है।")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Plan", current.get("plan_name") or "—")
+        c2.metric("Amount", f"₹{float(current.get('amount') or 0):,.2f}")
+        c3.metric("Status", status)
+        st.caption(f"Mobile: {_phone_display(current.get('phone'))}")
+        if current.get("payment_link") and status in {"LINK_SENT", "PAID"}:
+            st.markdown(f"[🔗 Open Payment Link]({current.get('payment_link')})")
+        st.markdown("---")
+    plans = _paid_subscription_plans()
+    if not plans:
+        st.warning("कोई active paid plan configured नहीं है। Admin Console → Plans में paid plans बनाएँ।")
+        return
+    labels = [f"{p.get('name', 'Plan')} • ₹{float(p.get('price') or 0):,.2f} • {int(p.get('duration_days') or 0)} days" for p in plans]
+    default_idx = 0
+    if current:
+        for i, p in enumerate(plans):
+            if str(p.get("id")) == str(current.get("plan_id")):
+                default_idx = i; break
+    choice = st.radio("Select Plan", labels, index=default_idx, key="manual_subscription_plan")
+    selected_plan = plans[labels.index(choice)]
+    phone = st.text_input("Mobile Number", value=str(current.get("phone") or "") if current else "", placeholder="10-digit mobile number", key="subscription_request_phone")
+    note = st.text_input("Optional Note", value=str(current.get("notes") or "") if current else "", key="subscription_request_note")
+    c1, c2 = st.columns(2)
+    c1.metric("Selected Plan", selected_plan.get("name", "—"))
+    c2.metric("Price / Validity", f"₹{float(selected_plan.get('price') or 0):,.2f} / {int(selected_plan.get('duration_days') or 0)} days")
+    if st.button("📩 Request Payment Link", type="primary", use_container_width=True, key="request_manual_payment_link"):
+        ok, request_row, err = create_subscription_request(user, selected_plan, phone, note)
+        if ok:
+            st.success("Request भेज दिया गया। Admin payment link भेजकर account activate करेगा.")
+            st.rerun()
+        else:
+            st.error(err or "Request save नहीं हुआ।")
+    if data:
+        _subscription_card(data)
+
+
 def admin_reset_user_password(user_id, new_password):
+
     """Reset any user's Supabase Auth password from the trusted server."""
     if not SUPABASE_SECRET_KEY:
         return False, "SUPABASE_SECRET_KEY Streamlit Secrets में configured नहीं है।"
@@ -2011,26 +2224,23 @@ def _subscription_card(data):
     p4.metric("Valid Until", end_dt.astimezone().strftime("%d-%m-%Y %H:%M") if end_dt else "—")
 
 
+
 def subscription_block_page(data, user):
-    st.markdown("## Subscription Required")
-    st.warning("आपका Trade Easy subscription अभी active नहीं है। Trading dashboard access बंद है।")
-    if data and data.get("status") == "EXPIRED":
-        st.error("Subscription expired हो चुका है।")
-    elif data and data.get("status") == "CANCELLED":
-        st.error("Subscription cancelled है।")
-    elif data and data.get("status") == "SUSPENDED":
-        st.error("Account/subscription suspended है।")
+    """Show the paid-plan request page after the 7-day trial expires."""
+    st.markdown("## 🔐 Subscription Required")
+    status = str((data or {}).get("status") or "NO_SUBSCRIPTION").upper()
+    if status == "EXPIRED":
+        st.error("आपका 7-दिन का trial / पिछला subscription expire हो चुका है।")
+    elif status == "CANCELLED":
+        st.error("आपका subscription cancelled है।")
+    elif status == "SUSPENDED":
+        st.error("आपका subscription suspended है।")
+    elif status == "SETUP_ERROR":
+        st.error("Subscription system load नहीं हो पाया।")
     else:
-        st.info("Admin से plan activate/extend करवाएँ।")
+        st.info("अपना paid plan चुनें और mobile number देकर payment link request करें। Admin payment verify करके आपका account activate करेगा।")
     _subscription_card(data)
-    st.caption(f"User: {getattr(user, 'email', '')}")
-    if st.button("Logout", key="subscription_logout", use_container_width=True):
-        try:
-            supabase.auth.sign_out()
-        except Exception:
-            pass
-        clear_oauth_params()
-        st.rerun()
+    subscription_request_page(user, data=data, allow_back=False)
 
 
 def render_admin_fyers_settings():
@@ -2107,7 +2317,7 @@ def render_admin_fyers_settings():
 def admin_dashboard(user, profile, workspace):
     """Admin console with separate FYERS settings and the same trading dashboard available to the admin."""
     st.markdown("# Trade Easy — Admin Console")
-    st.caption("Users • Plans • Subscriptions • Manual payments • Access control • FYERS • Trading")
+    st.caption("Users • Plans • Subscription Requests • Subscriptions • Manual Payments • Access Control • FYERS • Trading")
 
     admin_section = st.radio(
         "Admin Workspace",
@@ -2140,7 +2350,7 @@ def admin_dashboard(user, profile, workspace):
             clear_oauth_params()
             st.rerun()
 
-    profiles, plans, subscriptions, payments = admin_load_all()
+    profiles, plans, subscriptions, payments, requests = admin_load_all()
     now = _utc_now()
     active_subs = 0
     expiring = 0
@@ -2163,7 +2373,7 @@ def admin_dashboard(user, profile, workspace):
     a4.metric("Expired", expired)
     a5.metric("Plans", len(plans))
 
-    tabs = st.tabs(["Users", "Plans", "Subscriptions", "Payments", "Setup"])
+    tabs = st.tabs(["Users", "Plans", "Subscription Requests", "Subscriptions", "Payments", "Setup"])
 
     with tabs[0]:
         st.markdown("### User Management")
@@ -2249,6 +2459,48 @@ def admin_dashboard(user, profile, workspace):
                     st.error(f"Invalid Features JSON: {exc}")
 
     with tabs[2]:
+        st.markdown("### 📩 Subscription Requests")
+        if not requests:
+            st.info("अभी कोई payment-link request नहीं है।")
+        else:
+            profile_map = {p.get("id"): p for p in profiles}
+            rows = []
+            for req in requests:
+                prof = profile_map.get(req.get("user_id"), {})
+                rows.append({"Email": prof.get("email") or req.get("user_id"), "Mobile": _phone_display(req.get("phone")), "Plan": req.get("plan_name"), "Amount": req.get("amount"), "Status": req.get("status"), "Created": req.get("created_at"), "Request ID": req.get("id")})
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+            opts=[f"{profile_map.get(r.get('user_id'), {}).get('email', r.get('user_id'))} | {r.get('plan_name')} | {_phone_display(r.get('phone'))} | {r.get('id')}" for r in requests]
+            pick=st.selectbox("Select Request",opts,key="admin_request_pick")
+            rid=pick.split(" | ")[-1] if pick else None
+            current_req=next((r for r in requests if str(r.get("id"))==str(rid)),None)
+            if current_req:
+                prof=profile_map.get(current_req.get("user_id"),{})
+                st.markdown(f"**User:** {prof.get('email','—')} • **Mobile:** {_phone_display(current_req.get('phone'))}")
+                r1,r2=st.columns(2)
+                with r1:
+                    link=st.text_input("Payment Link",value=str(current_req.get("payment_link") or ""),key=f"request_link_{rid}",placeholder="https://...")
+                    pref=st.text_input("Payment Reference / UTR",value=str(current_req.get("payment_reference") or ""),key=f"request_pref_{rid}")
+                with r2:
+                    statuses=["PENDING","LINK_SENT","PAID","CANCELLED"]
+                    cs=str(current_req.get("status") or "PENDING").upper()
+                    stt=st.selectbox("Request Status",statuses,index=statuses.index(cs) if cs in statuses else 0,key=f"request_status_{rid}")
+                    note=st.text_input("Admin Note",value=str(current_req.get("notes") or ""),key=f"request_note_{rid}")
+                b1,b2,b3=st.columns(3)
+                with b1:
+                    if st.button("💾 Save Request",use_container_width=True,key=f"save_req_{rid}"):
+                        ok,err=admin_update_subscription_request(rid,status=stt,payment_link=link,payment_reference=pref,notes=note)
+                        st.success("Request updated.") if ok else st.error(err or "Request update failed")
+                        if ok: st.rerun()
+                with b2:
+                    if link and current_req.get("phone"):
+                        st.markdown(f'<a href="{_whatsapp_url(current_req.get("phone"),current_req.get("plan_name"),link)}" target="_blank" style="display:block;text-align:center;background:#1f8f4d;color:#fff;padding:10px 12px;border-radius:8px;text-decoration:none;font-weight:700;">📱 Open WhatsApp</a>',unsafe_allow_html=True)
+                with b3:
+                    if st.button("✅ Activate Account",use_container_width=True,type="primary",key=f"activate_req_{rid}"):
+                        ok,msg=admin_activate_subscription_request(current_req,pref,note)
+                        st.success(msg or "Account activated.") if ok else st.error(msg or "Activation failed")
+                        if ok: st.rerun()
+
+    with tabs[3]:
         st.markdown("### Subscription Management")
         if subscriptions:
             profile_map = {p.get("id"): p.get("email", "") for p in profiles}
@@ -2302,14 +2554,14 @@ def admin_dashboard(user, profile, workspace):
                 if ok:
                     st.rerun()
 
-    with tabs[3]:
+    with tabs[4]:
         st.markdown("### Payments")
         if payments:
             st.dataframe(pd.DataFrame(payments), use_container_width=True, hide_index=True)
         else:
-            st.info("Payment table में अभी कोई record नहीं है। यह module manual/webhook integrations के लिए तैयार है।")
+            st.info("अभी कोई payment record नहीं है। Admin द्वारा दर्ज किए गए manual payment references यहाँ दिखाई देंगे।")
 
-    with tabs[4]:
+    with tabs[5]:
         st.markdown("### Supabase Setup")
         st.info("आपके मौजूदा Supabase subscriptions schema के लिए compatibility setup SQL नीचे दिया गया है।")
         st.code(SUBSCRIPTION_SCHEMA_SQL, language="sql")
@@ -2317,111 +2569,47 @@ def admin_dashboard(user, profile, workspace):
 
 
 SUBSCRIPTION_SCHEMA_SQL = r"""
--- Trade Easy V6: compatibility setup for the EXISTING subscriptions schema.
--- Existing columns used by this project:
---   user_id, plan (text), provider, provider_customer_id,
---   provider_subscription_id, provider_plan_id, status,
---   starts_at, ends_at, payment_id, notes, created_at, updated_at
+-- Trade Easy manual subscription system.
+-- New users get one automatic 7-day TRIAL on first authenticated use.
+-- Paid subscriptions are requested by the user and activated by an admin.
 
--- Required read/write grants for authenticated users/admin console.
-grant usage on schema public to authenticated;
-grant select on public.profiles, public.plans, public.subscriptions, public.payments to authenticated;
-grant update on public.profiles to authenticated;
-grant insert, update, delete on public.plans to authenticated;
-grant insert, update, delete on public.subscriptions to authenticated;
-grant insert, update, delete on public.payments to authenticated;
+create table if not exists public.subscription_requests (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  plan_id uuid,
+  plan_name text not null,
+  amount numeric not null default 0,
+  duration_days integer not null default 30,
+  phone text not null,
+  status text not null default 'PENDING',
+  payment_link text,
+  payment_reference text,
+  notes text,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+create index if not exists subscription_requests_user_idx on public.subscription_requests(user_id, created_at desc);
+create index if not exists subscription_requests_status_idx on public.subscription_requests(status, created_at desc);
 
--- Ensure Free Trial exists.
 insert into public.plans(name, price, duration_days, features, is_active)
-values (
-  'Free Trial', 0, 7,
-  '{"live_price":true,"option_chain":true,"strategy":true,"paper_trading":true}'::jsonb,
-  true
-)
-on conflict (name) do nothing;
+values ('Free Trial', 0, 7, '{"live_price":true,"option_chain":true,"strategy":true,"paper_trading":true}'::jsonb, true)
+on conflict (name) do update set price=0,duration_days=7,is_active=true,updated_at=now();
 
--- Secure automatic trial creator using the EXISTING subscription schema.
-create or replace function public.ensure_trade_easy_trial()
-returns jsonb
-language plpgsql
-security definer
-set search_path = public
-as $$
-declare
-  uid uuid := auth.uid();
-  existing_id uuid;
-  existing_status text;
-  trial_days integer;
-  new_end timestamptz;
-  new_id uuid;
-begin
-  if uid is null then
-    raise exception 'Not authenticated';
-  end if;
+alter table public.subscription_requests enable row level security;
+revoke all on public.subscription_requests from anon, authenticated;
 
-  select s.id, s.status
-  into existing_id, existing_status
-  from public.subscriptions s
-  where s.user_id = uid
-  order by s.ends_at desc nulls last
-  limit 1;
-
-  if existing_id is not null then
-    return jsonb_build_object('subscription_id', existing_id, 'status', existing_status);
-  end if;
-
-  select duration_days
-  into trial_days
-  from public.plans
-  where lower(name) = 'free trial'
-    and is_active = true
-  order by created_at
-  limit 1;
-
-  if trial_days is null then
-    raise exception 'Free Trial plan is not configured';
-  end if;
-
-  new_end := now() + make_interval(days => trial_days);
-
-  insert into public.subscriptions
-  (
-    user_id, plan, provider, status, starts_at, ends_at, notes, updated_at
-  )
-  values
-  (
-    uid, 'FREE', 'INTERNAL', 'TRIAL', now(), new_end,
-    'Automatic first-login trial', now()
-  )
-  returning id into new_id;
-
-  return jsonb_build_object('subscription_id', new_id, 'status', 'TRIAL');
-end;
-$$;
-
-revoke all on function public.ensure_trade_easy_trial() from public;
-grant execute on function public.ensure_trade_easy_trial() to authenticated;
-
--- Keep normal users limited to their own subscription rows; active admin can see all.
 alter table public.subscriptions enable row level security;
-
 drop policy if exists subscriptions_select_self_or_admin on public.subscriptions;
-create policy subscriptions_select_self_or_admin
-on public.subscriptions
-for select to authenticated
-using (user_id = auth.uid() or public.trade_easy_is_admin());
-
--- Admin writes are allowed by the admin predicate.
+create policy subscriptions_select_self_or_admin on public.subscriptions for select to authenticated using (user_id=auth.uid() or public.trade_easy_is_admin());
 drop policy if exists subscriptions_admin_write on public.subscriptions;
-create policy subscriptions_admin_write
-on public.subscriptions
-for all to authenticated
-using (public.trade_easy_is_admin())
-with check (public.trade_easy_is_admin());
+create policy subscriptions_admin_write on public.subscriptions for all to authenticated using (public.trade_easy_is_admin()) with check (public.trade_easy_is_admin());
+
+alter table public.payments enable row level security;
+drop policy if exists payments_select_self_or_admin on public.payments;
+create policy payments_select_self_or_admin on public.payments for select to authenticated using (user_id=auth.uid() or public.trade_easy_is_admin());
+drop policy if exists payments_admin_write on public.payments;
+create policy payments_admin_write on public.payments for all to authenticated using (public.trade_easy_is_admin()) with check (public.trade_easy_is_admin());
 """
-
-
-
 
 def login_page():
     """Compact centered popup-style authentication screen."""
@@ -2606,8 +2794,14 @@ def login_page():
                             },
                         }
                     )
-                    if getattr(result, "user", None):
-                        st.success("Account created. अगर email confirmation enabled है तो पहले email confirm करें।")
+                    new_user = getattr(result, "user", None)
+                    if new_user:
+                        # Start the one-time 7-day trial as soon as the account is created.
+                        try:
+                            ensure_trial_subscription(getattr(new_user, "id", ""))
+                        except Exception:
+                            pass
+                        st.success("Account created. आपका 7-day Free Trial शुरू हो गया है। अगर email confirmation enabled है तो पहले email confirm करें।")
                     else:
                         st.error("Account creation failed.")
                 except Exception as e:
@@ -3586,6 +3780,9 @@ def render_permanent_dashboard_shell():
 
 def dashboard(user, workspace):
     paper_user_id = getattr(user, "id", "")
+    if st.session_state.get("show_subscription_request"):
+        subscription_request_page(user, data=st.session_state.get("trade_easy_subscription"), allow_back=True)
+        return
     paper_workspace_id = workspace.get("id") if workspace else "default"
     paper_state = load_paper_state(paper_user_id, paper_workspace_id)
 
@@ -3904,6 +4101,9 @@ def dashboard(user, workspace):
 
     with st.sidebar:
         st.header("Configuration")
+        if st.button("💳 Upgrade / Subscribe", use_container_width=True, key="open_upgrade_subscription"):
+            st.session_state["show_subscription_request"] = True
+            st.rerun()
         st.caption("Live market data is managed in the background. Broker credentials and connection controls are hidden from normal users.")
         index_name = st.selectbox("Trading Index", list(INDEX_SYMBOLS.keys()), index=0)
         symbol = INDEX_SYMBOLS[index_name]
@@ -5642,7 +5842,7 @@ def main():
     if profile is None:
         st.error("User profile system load नहीं हो पाया।")
         st.code(profile_error or "Unknown profile error")
-        st.info("Supabase में `Trade_Easy_SUBSCRIPTION_SETUP.sql` एक बार run करें।")
+        st.info("Admin Console → Setup में दिया गया subscription setup SQL एक बार run करें।")
         st.stop()
 
     # Admins bypass subscription gating so they can always manage users/plans.
