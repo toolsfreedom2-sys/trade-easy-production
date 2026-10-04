@@ -2633,199 +2633,46 @@ create policy payments_admin_write on public.payments for all to authenticated u
 
 
 # ============================================================
-# GOOGLE IDENTITY SERVICES AUTH
-# Uses Google's pre-built Sign in with Google button/One Tap and
-# exchanges the returned Google ID token directly with Supabase Auth.
-# This avoids the redirect-based Google OAuth page that is currently
-# returning a Google 403 in this deployment.
+# GOOGLE OAUTH
+# Stable Supabase OAuth redirect flow.
+# No custom component/frontend assets are required, so Community Cloud
+# can load the app normally even on Streamlit versions without Components V2.
 # ============================================================
 
-# Streamlit's V2 custom-component API keeps the Google button entirely in the
-# deployed Python app; no temp frontend directory or extra static assets are
-# required. This avoids Community Cloud component-asset loading failures.
-_GOOGLE_GSI_COMPONENT = None
+def google_oauth_login(button_key="main"):
+    """Start Google OAuth through the existing Supabase provider configuration."""
+    if not REDIRECT_URL:
+        st.error("Google Login के लिए TRADE_EASY_PUBLIC_URL / SUPABASE_REDIRECT_URL configured नहीं है।")
+        return False
 
-
-def _get_google_gsi_component():
-    global _GOOGLE_GSI_COMPONENT
-    if _GOOGLE_GSI_COMPONENT is not None:
-        return _GOOGLE_GSI_COMPONENT
-
-    # V2 is available in current Streamlit releases and supports inline
-    # HTML/JS plus frontend->Python trigger values.
-    components_v2 = getattr(getattr(st, "components", None), "v2", None)
-    if components_v2 is None or not hasattr(components_v2, "component"):
-        return None
-
-    html = """
-    <div class="te-google-root">
-      <div class="te-google-button"></div>
-      <div class="te-google-msg"></div>
-    </div>
-    """
-
-    js = """
-    export default function(component) {
-      const {data, parentElement, setTriggerValue} = component;
-      const root = parentElement.querySelector('.te-google-root');
-      const button = root ? root.querySelector('.te-google-button') : null;
-      const msg = root ? root.querySelector('.te-google-msg') : null;
-      if (!root || !button) return;
-
-      const clientId = data && data.client_id ? data.client_id : '';
-      const nonce = data && data.nonce ? data.nonce : '';
-      const width = Math.max(240, Math.min(360, Number(data && data.width) || 320));
-
-      if (!clientId) {
-        if (msg) msg.textContent = 'Google Client ID configured नहीं है।';
-        return;
-      }
-
-      const render = () => {
-        if (!window.google || !window.google.accounts || !window.google.accounts.id) {
-          setTimeout(render, 150);
-          return;
-        }
-        if (button.dataset.ready === '1') return;
-
-        try {
-          window.google.accounts.id.initialize({
-            client_id: clientId,
-            callback: (response) => {
-              if (response && response.credential) {
-                setTriggerValue('credential', response.credential);
-              } else if (msg) {
-                msg.textContent = 'Google credential नहीं मिला।';
-              }
+    try:
+        response = supabase.auth.sign_in_with_oauth({
+            "provider": "google",
+            "options": {
+                "redirect_to": REDIRECT_URL,
+                "queryParams": {
+                    "access_type": "offline",
+                    "prompt": "select_account",
+                },
             },
-            nonce: nonce,
-            auto_select: false,
-            cancel_on_tap_outside: true,
-            use_fedcm_for_prompt: true
-          });
+        })
+        url = getattr(response, "url", None)
+        if not url:
+            st.error("Google OAuth URL नहीं मिला। Supabase Google provider configuration जाँचें।")
+            return False
 
-          window.google.accounts.id.renderButton(button, {
-            type: 'standard',
-            theme: 'outline',
-            size: 'large',
-            text: 'continue_with',
-            shape: 'rectangular',
-            logo_alignment: 'left',
-            width: width
-          });
-          button.dataset.ready = '1';
-          if (msg) msg.textContent = '';
-        } catch (e) {
-          if (msg) msg.textContent = 'Google button load error: ' + (e && e.message ? e.message : e);
-        }
-      };
-
-      if (window.google && window.google.accounts && window.google.accounts.id) {
-        render();
-      } else if (!document.querySelector('script[data-trade-easy-google-gsi="1"]')) {
-        const script = document.createElement('script');
-        script.src = 'https://accounts.google.com/gsi/client';
-        script.async = true;
-        script.defer = true;
-        script.dataset.tradeEasyGoogleGsi = '1';
-        script.onload = render;
-        script.onerror = () => {
-          if (msg) msg.textContent = 'Google Sign-In library load नहीं हो सकी।';
-        };
-        document.head.appendChild(script);
-      } else {
-        render();
-      }
-    }
-    """
-
-    css = """
-    .te-google-root { width: 100%; text-align: center; }
-    .te-google-button { display: flex; justify-content: center; min-height: 44px; }
-    .te-google-msg { color: #b42318; font-size: 12px; min-height: 16px; margin-top: 4px; }
-    """
-
-    _GOOGLE_GSI_COMPONENT = components_v2.component(
-        "trade_easy_google_gsi_inline",
-        html=html,
-        css=css,
-        js=js,
-    )
-    return _GOOGLE_GSI_COMPONENT
-
-
-def render_google_gsi(button_key="main"):
-    """Render an inline Google Identity Services button without external component assets."""
-    if not GOOGLE_CLIENT_ID:
-        st.warning("Google Login के लिए Streamlit Secrets में GOOGLE_CLIENT_ID सेट करें।")
-        return None
-
-    comp = _get_google_gsi_component()
-    if comp is None:
-        st.error(
-            "इस Streamlit runtime में Custom Components V2 उपलब्ध नहीं है। "
-            "Google Sign-In button load नहीं किया जा सकता। Streamlit version update करें।"
+        # Replace the current app page with Google's authorization page.
+        # This avoids iframe/component issues on Streamlit Community Cloud.
+        st.markdown(
+            f'<meta http-equiv="refresh" content="0; url={url}">',
+            unsafe_allow_html=True,
         )
-        return None
-
-    nonce_key = f"google_raw_nonce_{button_key}"
-    raw_nonce = st.session_state.get(nonce_key)
-    if not raw_nonce:
-        raw_nonce = base64.urlsafe_b64encode(os.urandom(32)).decode("ascii").rstrip("=")
-        st.session_state[nonce_key] = raw_nonce
-
-    result = comp(
-        data={
-            "client_id": GOOGLE_CLIENT_ID,
-            "nonce": sha256(raw_nonce.encode("utf-8")).hexdigest(),
-            "width": 320,
-        },
-        key=f"google_gsi_{button_key}",
-        on_credential_change=lambda: None,
-        default={"credential": None},
-    )
-    return result
-
-
-def _google_result_credential(result):
-    if result is None:
-        return ""
-    try:
-        value = getattr(result, "credential", None)
-        if value:
-            return str(value).strip()
-    except Exception:
-        pass
-    if isinstance(result, dict):
-        return str(result.get("credential") or "").strip()
-    return ""
-
-
-def handle_google_gsi_result(result, button_key="main"):
-    """Exchange a one-time Google GSI credential for a Supabase session."""
-    token = _google_result_credential(result)
-    if not token:
-        return False
-
-    token_hash = sha256(token.encode("utf-8")).hexdigest()
-    if st.session_state.get(f"google_processed_{button_key}") == token_hash:
-        return False
-    st.session_state[f"google_processed_{button_key}"] = token_hash
-
-    raw_nonce = st.session_state.get(f"google_raw_nonce_{button_key}")
-    credentials = {"provider": "google", "token": token}
-    if raw_nonce:
-        credentials["nonce"] = raw_nonce
-
-    try:
-        response = supabase.auth.sign_in_with_id_token(credentials)
-        if getattr(response, "user", None) is not None:
-            return True
-        st.error("Google authentication succeeded, लेकिन Supabase session नहीं बनी।")
-        return False
+        st.info("Google Login खोल रहा है...")
+        return True
     except Exception as exc:
-        st.error(f"Google Sign-In error: {type(exc).__name__}: {exc}")
+        st.error(f"Google login error: {type(exc).__name__}: {exc}")
         return False
+
 
 def login_page():
     """Compact centered popup-style authentication screen."""
@@ -3012,12 +2859,13 @@ def login_page():
             '<div style="text-align:center;color:#64748b;font-size:11px;margin:10px 0 6px;">or continue with Google</div>',
             unsafe_allow_html=True,
         )
-        google_result = render_google_gsi("main")
-        if handle_google_gsi_result(google_result, "main"):
-            st.success("Google sign-in successful")
-            st.rerun()
+        if st.button("Continue with Google", use_container_width=True, key="google_login_stable"):
+            google_oauth_login("main")
 
-        st.markdown('<div class="te-auth-caption">Google से नया user account बने तो वही 7-day Free Trial लागू होगा.</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="te-auth-caption">Google से नया user account बने तो वही 7-day Free Trial लागू होगा.</div>',
+            unsafe_allow_html=True,
+        )
 
 
 # ============================================================
