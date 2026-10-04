@@ -10,6 +10,7 @@ import webbrowser
 import threading
 import unicodedata
 from pathlib import Path
+from urllib.parse import urlencode
 from hashlib import sha256
 from collections import deque
 from datetime import datetime, timezone, timedelta
@@ -78,6 +79,10 @@ TRADE_EASY_ADMIN_BOOTSTRAP_TOKEN = _config_value("TRADE_EASY_ADMIN_BOOTSTRAP_TOK
 
 TRADE_EASY_PUBLIC_URL = _config_value("TRADE_EASY_PUBLIC_URL")
 
+# Razorpay server-only credentials. Never expose the secret key in frontend code.
+RAZORPAY_KEY_ID = _config_value("RAZORPAY_KEY_ID")
+RAZORPAY_KEY_SECRET = _config_value("RAZORPAY_KEY_SECRET")
+
 REDIRECT_URL = _config_value(
     "SUPABASE_REDIRECT_URL",
     TRADE_EASY_PUBLIC_URL
@@ -99,8 +104,15 @@ if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
 if not TRADE_EASY_PUBLIC_URL:
     st.warning(
         "TRADE_EASY_PUBLIC_URL is not configured. Set it to the deployed "
-        "https://*.streamlit.app URL before using Google/FYERS OAuth."
+        "https://*.streamlit.app URL before using Google/FYERS OAuth/payment return."
     )
+
+if not RAZORPAY_KEY_ID or not RAZORPAY_KEY_SECRET:
+    st.warning(
+        "Razorpay payment gate is not configured yet. Add RAZORPAY_KEY_ID and "
+        "RAZORPAY_KEY_SECRET to Streamlit Secrets before enabling user payments."
+    )
+
 @st.cache_resource
 def get_supabase() -> Client:
     return create_client(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY)
@@ -1454,14 +1466,13 @@ def get_or_create_workspace(user):
 
 # ============================================================
 # ADMIN + SUBSCRIPTION SYSTEM
-# Uses Supabase tables protected by RLS. No payment gateway is assumed here;
-# payments can be recorded manually or connected later through webhooks.
+# Uses Supabase tables protected by RLS. Razorpay online payment is integrated
+# for paid subscription activation; the existing manual admin controls remain.
 # ============================================================
 
-SUBSCRIPTION_ENFORCEMENT = str(
-    os.environ.get("TRADE_EASY_SUBSCRIPTION_ENFORCEMENT", "true")
-).strip().lower() not in {"0", "false", "no", "off"}
-DEFAULT_TRIAL_DAYS = max(1, int(os.environ.get("TRADE_EASY_TRIAL_DAYS", "7")))
+# Paid subscription access is mandatory for normal users.
+# Admin accounts continue to bypass this gate so the admin console remains usable.
+SUBSCRIPTION_ENFORCEMENT = True
 
 
 def _utc_now():
@@ -1639,24 +1650,15 @@ def get_user_subscription(user_id):
         return {"error": str(exc), "subscription": None, "plan": None, "status": "SETUP_ERROR"}
 
 
-def ensure_trial_subscription(user_id):
-    """Create a 7-day Free Trial through the SECURITY DEFINER RPC."""
-    try:
-        result = supabase.rpc("ensure_trade_easy_trial", {}).execute()
-        if result.data:
-            return get_user_subscription(user_id)
-    except Exception:
-        pass
-    return get_user_subscription(user_id)
-
-
 def subscription_access_state(user_id):
-    """Return whether a normal user may access the trading dashboard."""
-    if not SUBSCRIPTION_ENFORCEMENT:
-        return True, {"status": "LEGACY_ACCESS", "subscription": None, "plan": None}
-    data = ensure_trial_subscription(user_id)
+    """Return whether a normal user may access the trading dashboard.
+
+    Only a verified ACTIVE paid subscription unlocks the dashboard.
+    TRIAL/PENDING/EXPIRED/CANCELLED/SUSPENDED states stay blocked.
+    """
+    data = get_user_subscription(user_id)
     status = str((data or {}).get("status") or "SETUP_ERROR").upper()
-    return status in {"ACTIVE", "TRIAL"}, data
+    return status == "ACTIVE", data
 
 
 def is_admin_profile(profile):
@@ -1706,6 +1708,304 @@ def get_supabase_admin() -> Client:
     # A dedicated client instance already prevents the normal user's session
     # from being mixed into the Admin client.
     return create_client(SUPABASE_URL, SUPABASE_SECRET_KEY)
+
+
+
+def _razorpay_enabled():
+    return bool(RAZORPAY_KEY_ID and RAZORPAY_KEY_SECRET)
+
+
+def _razorpay_request(method, path, payload=None, params=None):
+    """Call Razorpay REST API using server-side Basic Auth."""
+    if not _razorpay_enabled():
+        raise RuntimeError(
+            "Razorpay configured नहीं है। Streamlit Secrets में "
+            "RAZORPAY_KEY_ID और RAZORPAY_KEY_SECRET सेट करें।"
+        )
+
+    url = "https://api.razorpay.com/v1" + str(path)
+    response = requests.request(
+        method=str(method).upper(),
+        url=url,
+        auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET),
+        json=payload if payload is not None else None,
+        params=params if params is not None else None,
+        headers={"Content-Type": "application/json"},
+        timeout=20,
+    )
+
+    try:
+        data = response.json()
+    except Exception:
+        data = {"error": response.text}
+
+    if response.status_code < 200 or response.status_code >= 300:
+        detail = data.get("error") if isinstance(data, dict) else data
+        raise RuntimeError(f"Razorpay API error ({response.status_code}): {detail}")
+    return data
+
+
+def _razorpay_callback_url(reference_id):
+    base = str(TRADE_EASY_PUBLIC_URL or "").strip().rstrip("/")
+    if not base:
+        raise RuntimeError(
+            "TRADE_EASY_PUBLIC_URL configured नहीं है। Payment return flow के लिए "
+            "deployed Streamlit URL सेट करना जरूरी है।"
+        )
+    query = urlencode({"razorpay_return": "1", "ref": str(reference_id)})
+    return f"{base}/?{query}"
+
+
+def _razorpay_plan_payment(user, plan):
+    """Create a paid Razorpay Payment Link for the selected Trade Easy plan."""
+    if not user or not getattr(user, "id", None):
+        raise RuntimeError("Authenticated user नहीं मिला।")
+    if not plan:
+        raise RuntimeError("Subscription plan नहीं मिला।")
+
+    price = float(plan.get("price") or 0)
+    if price <= 0:
+        raise RuntimeError("Paid subscription के लिए plan price ₹0 से अधिक होना चाहिए।")
+
+    user_id = str(user.id)
+    email = str(getattr(user, "email", "") or "").strip()
+    metadata = getattr(user, "user_metadata", {}) or {}
+    name = (
+        metadata.get("display_name")
+        or metadata.get("full_name")
+        or metadata.get("name")
+        or email.split("@")[0]
+        or "Trade Easy User"
+    )
+    plan_id = str(plan.get("id") or "")
+
+    reference_id = f"TE-{user_id.replace('-', '')[:10]}-{uuid.uuid4().hex[:16]}"
+    callback_url = _razorpay_callback_url(reference_id)
+
+    payload = {
+        "amount": int(round(price * 100)),
+        "currency": "INR",
+        "accept_partial": False,
+        "reference_id": reference_id,
+        "description": f"Trade Easy {plan.get('name', 'Subscription')}",
+        "customer": {
+            "name": str(name)[:50],
+            "email": email[:100],
+        },
+        "notify": {
+            "email": bool(email),
+            "sms": False,
+        },
+        "reminder_enable": False,
+        "callback_url": callback_url,
+        "callback_method": "get",
+        "expire_by": int(time.time()) + 1800,
+        "notes": {
+            "app": "trade_easy",
+            "user_id": user_id,
+            "plan_id": plan_id,
+        },
+    }
+
+    link = _razorpay_request("POST", "/payment_links", payload=payload)
+    if not isinstance(link, dict) or not link.get("id") or not link.get("short_url"):
+        raise RuntimeError(f"Razorpay ने valid payment link नहीं लौटाया: {link}")
+
+    # Persist a pending subscription row. It cannot unlock access because the
+    # access gate accepts ONLY status='ACTIVE'.
+    admin_client = get_supabase_admin()
+    now = _utc_now().isoformat()
+    pending_payload = {
+        "user_id": user_id,
+        "plan": _subscription_plan_code(plan.get("name")),
+        "provider": "RAZORPAY",
+        "provider_subscription_id": reference_id,
+        "provider_plan_id": plan_id or None,
+        "status": "PENDING",
+        "starts_at": None,
+        "ends_at": None,
+        "payment_id": str(link.get("id")),
+        "notes": f"Razorpay Payment Link pending • {reference_id}",
+        "created_at": now,
+        "updated_at": now,
+    }
+    try:
+        admin_client.table("subscriptions").insert(pending_payload).execute()
+    except Exception as exc:
+        st.session_state["razorpay_pending_db_error"] = str(exc)
+
+    pending = {
+        "reference_id": reference_id,
+        "payment_link_id": str(link.get("id")),
+        "short_url": str(link.get("short_url")),
+        "plan_id": plan_id,
+        "plan_name": str(plan.get("name") or "Subscription"),
+        "amount": price,
+        "duration_days": int(plan.get("duration_days") or 30),
+        "created_at": time.time(),
+    }
+    st.session_state["razorpay_pending_payment"] = pending
+    return pending
+
+
+def _razorpay_fetch_payment_link(payment_link_id):
+    link_id = str(payment_link_id or "").strip()
+    if not link_id:
+        return None
+    return _razorpay_request("GET", f"/payment_links/{link_id}")
+
+
+def finalize_razorpay_payment(user, reference_id):
+    """Verify Razorpay Payment Link server-side, then activate the plan."""
+    if not user or not getattr(user, "id", None):
+        return False, "Login session उपलब्ध नहीं है।"
+
+    ref = str(reference_id or "").strip()
+    pending = st.session_state.get("razorpay_pending_payment") or {}
+    if not ref:
+        ref = str(pending.get("reference_id") or "").strip()
+    if not ref:
+        return False, "Payment reference नहीं मिला।"
+
+    admin_client = get_supabase_admin()
+    user_id = str(user.id)
+
+    try:
+        rows = (
+            admin_client.table("subscriptions")
+            .select(
+                "id,user_id,plan,provider,provider_subscription_id,provider_plan_id,"
+                "status,starts_at,ends_at,payment_id,notes"
+            )
+            .eq("user_id", user_id)
+            .eq("provider", "RAZORPAY")
+            .eq("provider_subscription_id", ref)
+            .limit(1)
+            .execute()
+            .data
+            or []
+        )
+    except Exception as exc:
+        return False, f"Pending payment lookup failed: {exc}"
+
+    if not rows:
+        return False, "यह payment session इस user के लिए नहीं मिला।"
+
+    pending_sub = rows[0]
+    link_id = str(pending_sub.get("payment_id") or pending.get("payment_link_id") or "").strip()
+    if not link_id:
+        return False, "Razorpay Payment Link ID उपलब्ध नहीं है।"
+
+    try:
+        link = _razorpay_fetch_payment_link(link_id)
+    except Exception as exc:
+        return False, f"Razorpay status verify नहीं हो सका: {exc}"
+
+    if not isinstance(link, dict):
+        return False, "Razorpay ने valid Payment Link response नहीं दिया।"
+    if str(link.get("id") or "") != link_id:
+        return False, "Payment Link identity mismatch."
+    if str(link.get("reference_id") or "") != ref:
+        return False, "Payment reference mismatch."
+
+    notes = link.get("notes") if isinstance(link.get("notes"), dict) else {}
+    if str(notes.get("user_id") or "") != user_id:
+        return False, "Payment user binding mismatch."
+    if str(notes.get("plan_id") or "") != str(pending_sub.get("provider_plan_id") or ""):
+        return False, "Payment plan binding mismatch."
+
+    if str(link.get("status") or "").lower() != "paid":
+        return False, f"Payment अभी verify नहीं हुआ। Razorpay status: {link.get('status') or 'unknown'}"
+
+    expected_amount = int(round(float(link.get("amount") or 0)))
+    paid_amount = int(round(float(link.get("amount_paid") or 0)))
+    if expected_amount <= 0 or paid_amount < expected_amount:
+        return False, "Paid amount verification failed."
+
+    plan = _load_plan(pending_sub.get("provider_plan_id"))
+    if not plan or not bool(plan.get("is_active")):
+        return False, "Selected subscription plan अब active नहीं है।"
+
+    # Idempotency: never create a second activation for the same pending row.
+    if str(pending_sub.get("status") or "").upper() == "ACTIVE":
+        st.session_state.pop("razorpay_pending_payment", None)
+        return True, f"Subscription already ACTIVE • {plan.get('name', 'Plan')}"
+
+    now = _utc_now()
+    existing = get_user_subscription(user_id)
+    existing_end = _parse_dt((existing or {}).get("subscription", {}).get("end_at")) if existing else None
+    start = existing_end if existing_end and existing_end > now else now
+    duration = int(plan.get("duration_days") or 30)
+    end = start + timedelta(days=duration)
+
+    payments = link.get("payments") if isinstance(link.get("payments"), list) else []
+    payment_id = None
+    if payments:
+        payment_id = payments[0].get("payment_id") or payments[0].get("id")
+    payment_id = str(payment_id or "").strip()
+    if not payment_id:
+        return False, "Razorpay payment ID नहीं मिला।"
+
+    update_payload = {
+        "provider": "RAZORPAY",
+        "status": "ACTIVE",
+        "starts_at": start.isoformat(),
+        "ends_at": end.isoformat(),
+        "payment_id": payment_id,
+        "notes": f"Razorpay verified payment • {link_id}",
+        "updated_at": now.isoformat(),
+    }
+
+    try:
+        updated = (
+            admin_client.table("subscriptions")
+            .update(update_payload)
+            .eq("id", pending_sub.get("id"))
+            .eq("user_id", user_id)
+            .eq("provider_subscription_id", ref)
+            .execute()
+        )
+        if not updated.data:
+            return False, "Verified payment के बाद subscription update नहीं हुआ।"
+
+        admin_client.table("payments").insert(
+            {
+                "user_id": user_id,
+                "subscription_id": pending_sub.get("id"),
+                "amount": expected_amount / 100.0,
+                "currency": "INR",
+                "payment_gateway": "RAZORPAY",
+                "payment_id": payment_id,
+                "status": "SUCCESS",
+                "paid_at": now.isoformat(),
+            }
+        ).execute()
+    except Exception as exc:
+        return False, f"Subscription activation failed: {exc}"
+
+    st.session_state.pop("razorpay_pending_payment", None)
+    st.session_state.pop("razorpay_pending_db_error", None)
+    return True, (
+        f"Payment verified • {plan.get('name', 'Subscription')} ACTIVE until "
+        f"{end.astimezone().strftime('%d-%m-%Y %H:%M')}"
+    )
+
+
+def _paid_subscription_plans():
+    """Return active, non-free plans available for online purchase."""
+    try:
+        rows = (
+            supabase.table("plans")
+            .select("id,name,price,duration_days,features,is_active,created_at")
+            .eq("is_active", True)
+            .order("price")
+            .execute()
+            .data
+            or []
+        )
+        return [p for p in rows if float(p.get("price") or 0) > 0]
+    except Exception:
+        return []
 
 
 def admin_reset_user_password(user_id, new_password):
@@ -2012,25 +2312,121 @@ def _subscription_card(data):
 
 
 def subscription_block_page(data, user):
-    st.markdown("## Subscription Required")
-    st.warning("आपका Trade Easy subscription अभी active नहीं है। Trading dashboard access बंद है।")
-    if data and data.get("status") == "EXPIRED":
-        st.error("Subscription expired हो चुका है।")
-    elif data and data.get("status") == "CANCELLED":
-        st.error("Subscription cancelled है।")
-    elif data and data.get("status") == "SUSPENDED":
-        st.error("Account/subscription suspended है।")
+    """Payment-first subscription wall. Trading dashboard is not rendered here."""
+    st.markdown("## 🔐 Subscription Required")
+    st.warning("Trading Dashboard खोलने के लिए पहले active paid subscription जरूरी है।")
+
+    current_status = str((data or {}).get("status") or "NO_SUBSCRIPTION").upper()
+    if current_status == "EXPIRED":
+        st.error("आपका पिछला subscription expire हो चुका है।")
+    elif current_status == "CANCELLED":
+        st.error("आपका subscription cancelled है।")
+    elif current_status == "SUSPENDED":
+        st.error("आपका subscription suspended है।")
+    elif current_status == "TRIAL":
+        st.info("Free Trial से dashboard access अब उपलब्ध नहीं है। Paid plan चुनकर payment करें।")
+    elif current_status == "PENDING":
+        st.info("आपका पिछला payment अभी verify नहीं हुआ है। नीचे payment status refresh करें।")
     else:
-        st.info("Admin से plan activate/extend करवाएँ।")
+        st.info("नीचे अपना paid subscription plan चुनें। Successful payment के बाद dashboard unlock होगा।")
+
     _subscription_card(data)
-    st.caption(f"User: {getattr(user, 'email', '')}")
-    if st.button("Logout", key="subscription_logout", use_container_width=True):
-        try:
-            supabase.auth.sign_out()
-        except Exception:
-            pass
-        clear_oauth_params()
-        st.rerun()
+
+    return_error = st.session_state.pop("razorpay_return_error", None)
+    if return_error:
+        st.error(f"Payment verification: {return_error}")
+
+    if not _razorpay_enabled():
+        st.error(
+            "Online payment अभी configured नहीं है। Admin को Streamlit Secrets में "
+            "`RAZORPAY_KEY_ID` और `RAZORPAY_KEY_SECRET` जोड़ना होगा।"
+        )
+    elif not TRADE_EASY_PUBLIC_URL:
+        st.error(
+            "Payment return URL configured नहीं है। Streamlit Secrets में "
+            "`TRADE_EASY_PUBLIC_URL` को exact deployed app URL पर सेट करें।"
+        )
+    else:
+        st.markdown("### 💳 Choose Subscription Plan")
+        plans = _paid_subscription_plans()
+        selected_plan = None
+
+        if plans:
+            labels = [
+                f"{p.get('name', 'Plan')} • ₹{float(p.get('price') or 0):,.2f} • {int(p.get('duration_days') or 0)} days"
+                for p in plans
+            ]
+            choice = st.radio(
+                "Paid plans",
+                labels,
+                index=0,
+                key="razorpay_plan_choice",
+            )
+            selected_plan = plans[labels.index(choice)]
+
+            st.caption(
+                f"Plan: **{selected_plan.get('name')}** • "
+                f"₹{float(selected_plan.get('price') or 0):,.2f} • "
+                f"Validity: **{int(selected_plan.get('duration_days') or 0)} days**"
+            )
+
+            if st.button(
+                "🔒 Create Secure Razorpay Payment",
+                use_container_width=True,
+                type="primary",
+                key="create_razorpay_payment",
+            ):
+                try:
+                    pending = _razorpay_plan_payment(user, selected_plan)
+                    st.success("Razorpay payment link तैयार है। नीचे जाकर payment पूरा करें।")
+                    st.link_button(
+                        f"💳 Pay ₹{pending['amount']:,.2f} on Razorpay",
+                        pending["short_url"],
+                        use_container_width=True,
+                    )
+                    st.caption(
+                        "Payment complete होने के बाद Razorpay इसी app पर लौटाएगा और "
+                        "server-side verification के बाद subscription ACTIVE होगा।"
+                    )
+                except Exception as exc:
+                    st.error(f"Razorpay payment link create नहीं हो सका: {exc}")
+        else:
+            st.warning(
+                "कोई active paid plan उपलब्ध नहीं है। Admin Console → Plans में "
+                "कम-से-कम एक paid active plan बनाइए।"
+            )
+
+    pending = st.session_state.get("razorpay_pending_payment") or {}
+    if pending.get("short_url"):
+        st.markdown("---")
+        st.markdown("### 🧾 Pending Payment")
+        p1, p2, p3 = st.columns(3)
+        p1.metric("Plan", pending.get("plan_name", "—"))
+        p2.metric("Amount", f"₹{float(pending.get('amount') or 0):,.2f}")
+        p3.metric("Validity", f"{int(pending.get('duration_days') or 0)} days")
+
+        st.link_button(
+            "💳 Continue / Open Razorpay Checkout",
+            pending["short_url"],
+            use_container_width=True,
+        )
+
+        if st.button(
+            "✅ I Have Paid — Verify Payment",
+            use_container_width=True,
+            key="verify_razorpay_payment",
+        ):
+            ok, message = finalize_razorpay_payment(
+                user,
+                pending.get("reference_id"),
+            )
+            if ok:
+                st.success(message)
+                st.rerun()
+            else:
+                st.warning(message)
+
+
 
 
 def render_admin_fyers_settings():
@@ -2107,7 +2503,7 @@ def render_admin_fyers_settings():
 def admin_dashboard(user, profile, workspace):
     """Admin console with separate FYERS settings and the same trading dashboard available to the admin."""
     st.markdown("# Trade Easy — Admin Console")
-    st.caption("Users • Plans • Subscriptions • Manual payments • Access control • FYERS • Trading")
+    st.caption("Users • Plans • Subscriptions • Razorpay/Manual payments • Access control • FYERS • Trading")
 
     admin_section = st.radio(
         "Admin Workspace",
@@ -2307,7 +2703,7 @@ def admin_dashboard(user, profile, workspace):
         if payments:
             st.dataframe(pd.DataFrame(payments), use_container_width=True, hide_index=True)
         else:
-            st.info("Payment table में अभी कोई record नहीं है। यह module manual/webhook integrations के लिए तैयार है।")
+            st.info("अभी कोई payment record नहीं है। Razorpay verification के बाद successful payments यहाँ दिखाई देंगे।")
 
     with tabs[4]:
         st.markdown("### Supabase Setup")
@@ -2317,13 +2713,12 @@ def admin_dashboard(user, profile, workspace):
 
 
 SUBSCRIPTION_SCHEMA_SQL = r"""
--- Trade Easy V6: compatibility setup for the EXISTING subscriptions schema.
--- Existing columns used by this project:
+-- Trade Easy payment-gate compatibility setup for the EXISTING schema.
+-- Existing columns:
 --   user_id, plan (text), provider, provider_customer_id,
 --   provider_subscription_id, provider_plan_id, status,
 --   starts_at, ends_at, payment_id, notes, created_at, updated_at
 
--- Required read/write grants for authenticated users/admin console.
 grant usage on schema public to authenticated;
 grant select on public.profiles, public.plans, public.subscriptions, public.payments to authenticated;
 grant update on public.profiles to authenticated;
@@ -2331,78 +2726,15 @@ grant insert, update, delete on public.plans to authenticated;
 grant insert, update, delete on public.subscriptions to authenticated;
 grant insert, update, delete on public.payments to authenticated;
 
--- Ensure Free Trial exists.
-insert into public.plans(name, price, duration_days, features, is_active)
-values (
-  'Free Trial', 0, 7,
-  '{"live_price":true,"option_chain":true,"strategy":true,"paper_trading":true}'::jsonb,
-  true
-)
-on conflict (name) do nothing;
+-- Free Trial must not unlock the production dashboard.
+update public.plans
+set is_active = false,
+    updated_at = now()
+where lower(name) = 'free trial';
 
--- Secure automatic trial creator using the EXISTING subscription schema.
-create or replace function public.ensure_trade_easy_trial()
-returns jsonb
-language plpgsql
-security definer
-set search_path = public
-as $$
-declare
-  uid uuid := auth.uid();
-  existing_id uuid;
-  existing_status text;
-  trial_days integer;
-  new_end timestamptz;
-  new_id uuid;
-begin
-  if uid is null then
-    raise exception 'Not authenticated';
-  end if;
+-- Disable the old automatic-trial RPC so it cannot be used as a bypass.
+revoke all on function public.ensure_trade_easy_trial() from authenticated;
 
-  select s.id, s.status
-  into existing_id, existing_status
-  from public.subscriptions s
-  where s.user_id = uid
-  order by s.ends_at desc nulls last
-  limit 1;
-
-  if existing_id is not null then
-    return jsonb_build_object('subscription_id', existing_id, 'status', existing_status);
-  end if;
-
-  select duration_days
-  into trial_days
-  from public.plans
-  where lower(name) = 'free trial'
-    and is_active = true
-  order by created_at
-  limit 1;
-
-  if trial_days is null then
-    raise exception 'Free Trial plan is not configured';
-  end if;
-
-  new_end := now() + make_interval(days => trial_days);
-
-  insert into public.subscriptions
-  (
-    user_id, plan, provider, status, starts_at, ends_at, notes, updated_at
-  )
-  values
-  (
-    uid, 'FREE', 'INTERNAL', 'TRIAL', now(), new_end,
-    'Automatic first-login trial', now()
-  )
-  returning id into new_id;
-
-  return jsonb_build_object('subscription_id', new_id, 'status', 'TRIAL');
-end;
-$$;
-
-revoke all on function public.ensure_trade_easy_trial() from public;
-grant execute on function public.ensure_trade_easy_trial() to authenticated;
-
--- Keep normal users limited to their own subscription rows; active admin can see all.
 alter table public.subscriptions enable row level security;
 
 drop policy if exists subscriptions_select_self_or_admin on public.subscriptions;
@@ -2411,14 +2743,31 @@ on public.subscriptions
 for select to authenticated
 using (user_id = auth.uid() or public.trade_easy_is_admin());
 
--- Admin writes are allowed by the admin predicate.
+-- Only the admin/server-side service-role client should write subscriptions.
 drop policy if exists subscriptions_admin_write on public.subscriptions;
 create policy subscriptions_admin_write
 on public.subscriptions
 for all to authenticated
 using (public.trade_easy_is_admin())
 with check (public.trade_easy_is_admin());
+
+alter table public.payments enable row level security;
+
+drop policy if exists payments_select_self_or_admin on public.payments;
+create policy payments_select_self_or_admin
+on public.payments
+for select to authenticated
+using (user_id = auth.uid() or public.trade_easy_is_admin());
+
+-- Successful Razorpay payment records are written by the server-side secret key.
+drop policy if exists payments_admin_write on public.payments;
+create policy payments_admin_write
+on public.payments
+for all to authenticated
+using (public.trade_easy_is_admin())
+with check (public.trade_easy_is_admin());
 """
+
 
 
 
@@ -5644,6 +5993,23 @@ def main():
         st.code(profile_error or "Unknown profile error")
         st.info("Supabase में `Trade_Easy_SUBSCRIPTION_SETUP.sql` एक बार run करें।")
         st.stop()
+
+    # ------------------------------------------------------------
+    # RAZORPAY PAYMENT RETURN / SERVER-SIDE VERIFICATION
+    # ------------------------------------------------------------
+    # The callback reference is only a locator. Payment authenticity is
+    # established by fetching the Payment Link directly from Razorpay with
+    # the server-only API secret.
+    razorpay_return = str(st.query_params.get("razorpay_return") or "")
+    razorpay_ref = str(st.query_params.get("ref") or "")
+    if razorpay_return == "1":
+        ok, message = finalize_razorpay_payment(user, razorpay_ref)
+        clear_oauth_params()
+        if ok:
+            st.success(f"✅ {message}")
+            st.rerun()
+        else:
+            st.session_state["razorpay_return_error"] = message
 
     # Admins bypass subscription gating so they can always manage users/plans.
     if is_admin_profile(profile):
