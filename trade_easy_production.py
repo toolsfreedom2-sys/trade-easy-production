@@ -2882,7 +2882,7 @@ def login_page():
                 except Exception as e:
                     st.error(f"Login error: {e}")
 
-            forgot_left, forgot_col, forgot_right = st.columns([1, 16, 1])
+            forgot_left, forgot_col, forgot_right = st.columns([1, 20, 1])
             with forgot_col:
                 if st.button("Forgot Password?", use_container_width=True, key="forgot_password_btn"):
                     if not email.strip():
