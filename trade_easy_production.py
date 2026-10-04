@@ -78,13 +78,7 @@ TRADE_EASY_ADMIN_EMAIL = _config_value("TRADE_EASY_ADMIN_EMAIL", "markam296@gmai
 TRADE_EASY_ADMIN_BOOTSTRAP_TOKEN = _config_value("TRADE_EASY_ADMIN_BOOTSTRAP_TOKEN")
 
 TRADE_EASY_PUBLIC_URL = _config_value("TRADE_EASY_PUBLIC_URL")
-# Google Web OAuth Client ID for Google Identity Services popup/One Tap.
-GOOGLE_CLIENT_ID = _config_value("GOOGLE_CLIENT_ID")
 
-REDIRECT_URL = _config_value(
-    "SUPABASE_REDIRECT_URL",
-    TRADE_EASY_PUBLIC_URL
-)
 
 FYERS_CONFIG_APP_ID = _config_value("FYERS_APP_ID")
 FYERS_CONFIG_SECRET = _config_value("FYERS_SECRET_ID")
@@ -102,12 +96,7 @@ if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
 if not TRADE_EASY_PUBLIC_URL:
     st.warning(
         "TRADE_EASY_PUBLIC_URL is not configured. Set it to the deployed "
-        "https://*.streamlit.app URL before using password recovery/FYERS."
-    )
-if not GOOGLE_CLIENT_ID:
-    st.warning(
-        "GOOGLE_CLIENT_ID is not configured. Add the Google Web OAuth Client ID "
-        "from Google Cloud to Streamlit Secrets for Google Sign-In."
+        "https://*.streamlit.app URL before using password recovery/FYERS OAuth."
     )
 
 
@@ -1396,31 +1385,11 @@ def fyers_ltp_feed(access_token, app_id, symbol):
 # ============================================================
 
 def get_current_user():
-    """Return the active Supabase user using both user and session APIs.
-
-    Streamlit can rerun immediately after authentication. Some supabase-py
-    versions briefly expose the authenticated identity via get_session() before
-    get_user() sees it, so we try both paths.
-    """
     try:
         response = supabase.auth.get_user()
-        user = getattr(response, "user", None)
-        if user is not None:
-            return user
+        return getattr(response, "user", None)
     except Exception:
-        pass
-    try:
-        session = supabase.auth.get_session()
-        user = getattr(session, "user", None)
-        if user is not None:
-            return user
-        sess = getattr(session, "session", None)
-        user = getattr(sess, "user", None) if sess is not None else None
-        if user is not None:
-            return user
-    except Exception:
-        pass
-    return None
+        return None
 
 
 def clear_oauth_params():
@@ -2651,402 +2620,188 @@ drop policy if exists payments_admin_write on public.payments;
 create policy payments_admin_write on public.payments for all to authenticated using (public.trade_easy_is_admin()) with check (public.trade_easy_is_admin());
 """
 
-
-# ============================================================
-# GOOGLE IDENTITY SERVICES AUTH
-# Uses Google's pre-built Sign in with Google button/One Tap and
-# exchanges the returned Google ID token directly with Supabase Auth.
-# This avoids the redirect-based Google OAuth page that is currently
-# returning a Google 403 in this deployment.
-# ============================================================
-
-# Streamlit's V2 custom-component API keeps the Google button entirely in the
-# deployed Python app; no temp frontend directory or extra static assets are
-# required. This avoids Community Cloud component-asset loading failures.
-_GOOGLE_GSI_COMPONENT = None
-
-
-def _get_google_gsi_component():
-    global _GOOGLE_GSI_COMPONENT
-    if _GOOGLE_GSI_COMPONENT is not None:
-        return _GOOGLE_GSI_COMPONENT
-
-    # V2 is available in current Streamlit releases and supports inline
-    # HTML/JS plus frontend->Python trigger values.
-    components_v2 = getattr(getattr(st, "components", None), "v2", None)
-    if components_v2 is None or not hasattr(components_v2, "component"):
-        return None
-
-    html = """
-    <div class="te-google-root">
-      <div class="te-google-button"></div>
-      <div class="te-google-msg"></div>
-    </div>
-    """
-
-    js = """
-    export default function(component) {
-      const {data, parentElement, setTriggerValue} = component;
-      const root = parentElement.querySelector('.te-google-root');
-      const button = root ? root.querySelector('.te-google-button') : null;
-      const msg = root ? root.querySelector('.te-google-msg') : null;
-      if (!root || !button) return;
-
-      const clientId = data && data.client_id ? data.client_id : '';
-      const nonce = data && data.nonce ? data.nonce : '';
-      const width = Math.max(240, Math.min(360, Number(data && data.width) || 320));
-
-      if (!clientId) {
-        if (msg) msg.textContent = 'Google Client ID configured नहीं है।';
-        return;
-      }
-
-      const render = () => {
-        if (!window.google || !window.google.accounts || !window.google.accounts.id) {
-          setTimeout(render, 150);
-          return;
-        }
-        if (button.dataset.ready === '1') return;
-
-        try {
-          window.google.accounts.id.initialize({
-            client_id: clientId,
-            callback: (response) => {
-              if (response && response.credential) {
-                setTriggerValue('credential', response.credential);
-              } else if (msg) {
-                msg.textContent = 'Google credential नहीं मिला।';
-              }
-            },
-            nonce: nonce,
-            auto_select: false,
-            cancel_on_tap_outside: true,
-            use_fedcm_for_prompt: true
-          });
-
-          window.google.accounts.id.renderButton(button, {
-            type: 'standard',
-            theme: 'outline',
-            size: 'large',
-            text: 'continue_with',
-            shape: 'rectangular',
-            logo_alignment: 'left',
-            width: width
-          });
-          button.dataset.ready = '1';
-          if (msg) msg.textContent = '';
-        } catch (e) {
-          if (msg) msg.textContent = 'Google button load error: ' + (e && e.message ? e.message : e);
-        }
-      };
-
-      if (window.google && window.google.accounts && window.google.accounts.id) {
-        render();
-      } else if (!document.querySelector('script[data-trade-easy-google-gsi="1"]')) {
-        const script = document.createElement('script');
-        script.src = 'https://accounts.google.com/gsi/client';
-        script.async = true;
-        script.defer = true;
-        script.dataset.tradeEasyGoogleGsi = '1';
-        script.onload = render;
-        script.onerror = () => {
-          if (msg) msg.textContent = 'Google Sign-In library load नहीं हो सकी।';
-        };
-        document.head.appendChild(script);
-      } else {
-        render();
-      }
-    }
-    """
-
-    css = """
-    .te-google-root { width: 100%; text-align: center; }
-    .te-google-button { display: flex; justify-content: center; min-height: 44px; }
-    .te-google-msg { color: #b42318; font-size: 12px; min-height: 16px; margin-top: 4px; }
-    """
-
-    _GOOGLE_GSI_COMPONENT = components_v2.component(
-        "trade_easy_google_gsi_inline",
-        html=html,
-        css=css,
-        js=js,
-    )
-    return _GOOGLE_GSI_COMPONENT
-
-
-def render_google_gsi(button_key="main"):
-    """Render an inline Google Identity Services button without external component assets."""
-    if not GOOGLE_CLIENT_ID:
-        st.warning("Google Login के लिए Streamlit Secrets में GOOGLE_CLIENT_ID सेट करें।")
-        return None
-
-    comp = _get_google_gsi_component()
-    if comp is None:
-        st.error(
-            "इस Streamlit runtime में Custom Components V2 उपलब्ध नहीं है। "
-            "Google Sign-In button load नहीं किया जा सकता। Streamlit version update करें।"
-        )
-        return None
-
-    nonce_key = f"google_raw_nonce_{button_key}"
-    raw_nonce = st.session_state.get(nonce_key)
-    if not raw_nonce:
-        raw_nonce = base64.urlsafe_b64encode(os.urandom(32)).decode("ascii").rstrip("=")
-        st.session_state[nonce_key] = raw_nonce
-
-    result = comp(
-        data={
-            "client_id": GOOGLE_CLIENT_ID,
-            "nonce": sha256(raw_nonce.encode("utf-8")).hexdigest(),
-            "width": 320,
-        },
-        key=f"google_gsi_{button_key}",
-        on_credential_change=lambda: None,
-        default={"credential": None},
-    )
-    return result
-
-
-def _google_result_credential(result):
-    if result is None:
-        return ""
-    try:
-        value = getattr(result, "credential", None)
-        if value:
-            return str(value).strip()
-    except Exception:
-        pass
-    if isinstance(result, dict):
-        return str(result.get("credential") or "").strip()
-    return ""
-
-
-def handle_google_gsi_result(result, button_key="main"):
-    """Exchange a one-time Google GSI credential for a Supabase session."""
-    token = _google_result_credential(result)
-    if not token:
-        return False
-
-    token_hash = sha256(token.encode("utf-8")).hexdigest()
-    if st.session_state.get(f"google_processed_{button_key}") == token_hash:
-        return False
-    st.session_state[f"google_processed_{button_key}"] = token_hash
-
-    raw_nonce = st.session_state.get(f"google_raw_nonce_{button_key}")
-    credentials = {"provider": "google", "token": token}
-    if raw_nonce:
-        credentials["nonce"] = raw_nonce
-
-    try:
-        response = supabase.auth.sign_in_with_id_token(credentials)
-        signed_user = getattr(response, "user", None)
-        if signed_user is not None:
-            st.session_state["trade_easy_google_user_id"] = str(getattr(signed_user, "id", ""))
-            st.session_state["trade_easy_google_user_email"] = str(getattr(signed_user, "email", "") or "")
-            return True
-        st.error("Google authentication succeeded, लेकिन Supabase session नहीं बनी।")
-        return False
-    except Exception as exc:
-        st.error(f"Google Sign-In error: {type(exc).__name__}: {exc}")
-        return False
-
 def login_page():
     """Compact centered popup-style authentication screen."""
-    login_shell = st.container(key="te_login_shell")
-    with login_shell:
+    st.markdown("""
+    <style>
+    /* Compact popup: logo and form live in the same visual card. */
+    .stApp {
+        background:
+            radial-gradient(circle at 15% 18%, rgba(38,99,235,.20), transparent 30%),
+            radial-gradient(circle at 85% 18%, rgba(139,92,246,.16), transparent 28%),
+            linear-gradient(135deg,#050b16 0%,#0a1222 48%,#060b14 100%);
+    }
+    [data-testid="stHeader"] { background: transparent; }
+    [data-testid="stToolbar"] { display:none; }
+
+    /* The authentication row itself becomes the popup. */
+    .stApp .stHorizontalBlock {
+        max-width: 520px !important;
+        margin: 7vh auto 0 auto !important;
+        align-items: stretch !important;
+    }
+    .stApp .stHorizontalBlock > div[data-testid="column"] {
+        display: none;
+    }
+    .stApp .stHorizontalBlock > div[data-testid="column"]:nth-child(2) {
+        display: block !important;
+        flex: 0 0 100% !important;
+        width: 100% !important;
+        max-width: 100% !important;
+        padding: 24px 34px 24px !important;
+        border-radius: 22px !important;
+        background: rgba(12,20,35,.92) !important;
+        border: 1px solid rgba(148,163,184,.20) !important;
+        box-shadow: 0 24px 80px rgba(0,0,0,.48), inset 0 1px 0 rgba(255,255,255,.05) !important;
+        backdrop-filter: blur(18px);
+        box-sizing: border-box !important;
+    }
+
+    .te-auth-brand { text-align:center; margin:0 0 12px 0; }
+    .te-auth-logo {
+        width:52px;height:52px;margin:0 auto 7px;border-radius:15px;
+        display:flex;align-items:center;justify-content:center;
+        font-size:25px;font-weight:900;
+        background:linear-gradient(135deg,#2563eb,#7c3aed);
+        color:#fff;box-shadow:0 9px 25px rgba(37,99,235,.25);
+    }
+    .te-auth-title { color:#f8fafc;font-size:24px;font-weight:850;line-height:1.05;letter-spacing:-.4px; }
+    .te-auth-sub { color:#94a3b8;font-size:11px;margin-top:4px; }
+
+    div[data-testid="stTabs"] { margin-top: 2px !important; }
+    div[data-testid="stTabs"] button { font-size:13px !important; font-weight:700 !important; }
+    div[data-testid="stTabsContent"] { padding-top: 10px !important; }
+
+    /* White input boxes with dark text for clear typing. */
+    div[data-testid="stTextInput"] { margin-bottom: 7px !important; }
+    div[data-testid="stTextInput"] label {
+        color:#cbd5e1 !important;
+        font-size:12px !important;
+        font-weight:600 !important;
+        margin-bottom:3px !important;
+    }
+    div[data-testid="stTextInput"] input,
+    div[data-testid="stTextInput"] input:focus {
+        background:#ffffff !important;
+        color:#111827 !important;
+        -webkit-text-fill-color:#111827 !important;
+        caret-color:#111827 !important;
+        border:1px solid #cbd5e1 !important;
+        border-radius:10px !important;
+        box-shadow:none !important;
+        min-height:40px !important;
+    }
+    div[data-testid="stTextInput"] input::placeholder {
+        color:#6b7280 !important;
+        opacity:1 !important;
+    }
+    div[data-testid="stTextInput"] input:focus {
+        border-color:#64748b !important;
+        box-shadow:0 0 0 2px rgba(59,130,246,.14) !important;
+    }
+
+    div.stButton { margin-top:7px !important; }
+    div.stButton > button {
+        border-radius:10px !important;
+        min-height:40px !important;
+        font-weight:700 !important;
+    }
+    .te-auth-caption {
+        color:#64748b;font-size:10px;text-align:center;margin-top:10px;
+    }
+
+    @media (max-width: 640px) {
+        .stApp .stHorizontalBlock {
+            max-width: calc(100% - 24px) !important;
+            margin-top: 4vh !important;
+        }
+        .stApp .stHorizontalBlock > div[data-testid="column"]:nth-child(2) {
+            padding:20px 18px 18px !important;
+        }
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    left, center, right = st.columns([1.15, 1.7, 1.15])
+    with center:
         st.markdown("""
-        <style>
-        /* Compact popup: logo and form live in the same visual card. */
-        .stApp {
-            background:
-                radial-gradient(circle at 15% 18%, rgba(38,99,235,.20), transparent 30%),
-                radial-gradient(circle at 85% 18%, rgba(139,92,246,.16), transparent 28%),
-                linear-gradient(135deg,#050b16 0%,#0a1222 48%,#060b14 100%);
-        }
-        [data-testid="stHeader"] { background: transparent; }
-        [data-testid="stToolbar"] { display:none; }
-
-        /* Login-only popup styling. Scoped to te_login_shell so dashboard columns
-           remain fully visible after authentication. */
-        .st-key-te_login_shell .stHorizontalBlock {
-            max-width: 520px !important;
-            margin: 7vh auto 0 auto !important;
-            align-items: stretch !important;
-        }
-        .st-key-te_login_shell .stHorizontalBlock > div[data-testid="column"] {
-            display: none !important;
-        }
-        .st-key-te_login_shell .stHorizontalBlock > div[data-testid="column"]:nth-child(2) {
-            display: block !important;
-            flex: 0 0 100% !important;
-            width: 100% !important;
-            max-width: 100% !important;
-            padding: 24px 34px 24px !important;
-            border-radius: 22px !important;
-            background: rgba(12,20,35,.92) !important;
-            border: 1px solid rgba(148,163,184,.20) !important;
-            box-shadow: 0 24px 80px rgba(0,0,0,.48), inset 0 1px 0 rgba(255,255,255,.05) !important;
-            backdrop-filter: blur(18px);
-            box-sizing: border-box !important;
-        }
-
-        .te-auth-brand { text-align:center; margin:0 0 12px 0; }
-        .te-auth-logo {
-            width:52px;height:52px;margin:0 auto 7px;border-radius:15px;
-            display:flex;align-items:center;justify-content:center;
-            font-size:25px;font-weight:900;
-            background:linear-gradient(135deg,#2563eb,#7c3aed);
-            color:#fff;box-shadow:0 9px 25px rgba(37,99,235,.25);
-        }
-        .te-auth-title { color:#f8fafc;font-size:24px;font-weight:850;line-height:1.05;letter-spacing:-.4px; }
-        .te-auth-sub { color:#94a3b8;font-size:11px;margin-top:4px; }
-
-        div[data-testid="stTabs"] { margin-top: 2px !important; }
-        div[data-testid="stTabs"] button { font-size:13px !important; font-weight:700 !important; }
-        div[data-testid="stTabsContent"] { padding-top: 10px !important; }
-
-        /* White input boxes with dark text for clear typing. */
-        div[data-testid="stTextInput"] { margin-bottom: 7px !important; }
-        div[data-testid="stTextInput"] label {
-            color:#cbd5e1 !important;
-            font-size:12px !important;
-            font-weight:600 !important;
-            margin-bottom:3px !important;
-        }
-        div[data-testid="stTextInput"] input,
-        div[data-testid="stTextInput"] input:focus {
-            background:#ffffff !important;
-            color:#111827 !important;
-            -webkit-text-fill-color:#111827 !important;
-            caret-color:#111827 !important;
-            border:1px solid #cbd5e1 !important;
-            border-radius:10px !important;
-            box-shadow:none !important;
-            min-height:40px !important;
-        }
-        div[data-testid="stTextInput"] input::placeholder {
-            color:#6b7280 !important;
-            opacity:1 !important;
-        }
-        div[data-testid="stTextInput"] input:focus {
-            border-color:#64748b !important;
-            box-shadow:0 0 0 2px rgba(59,130,246,.14) !important;
-        }
-
-        div.stButton { margin-top:7px !important; }
-        div.stButton > button {
-            border-radius:10px !important;
-            min-height:40px !important;
-            font-weight:700 !important;
-        }
-        .te-auth-caption {
-            color:#64748b;font-size:10px;text-align:center;margin-top:10px;
-        }
-
-        @media (max-width: 640px) {
-            .st-key-te_login_shell .stHorizontalBlock {
-                max-width: calc(100% - 24px) !important;
-                margin-top: 4vh !important;
-            }
-            .st-key-te_login_shell .stHorizontalBlock > div[data-testid="column"]:nth-child(2) {
-                padding:20px 18px 18px !important;
-            }
-        }
-        </style>
+        <div class="te-auth-brand">
+          <div class="te-auth-logo">TE</div>
+          <div class="te-auth-title">Trade Easy</div>
+          <div class="te-auth-sub">Index Trading Confirmation &amp; Risk Control</div>
+        </div>
         """, unsafe_allow_html=True)
 
-        left, center, right = st.columns([1.15, 1.7, 1.15])
-        with center:
-            st.markdown("""
-            <div class="te-auth-brand">
-              <div class="te-auth-logo">TE</div>
-              <div class="te-auth-title">Trade Easy</div>
-              <div class="te-auth-sub">Index Trading Confirmation &amp; Risk Control</div>
-            </div>
-            """, unsafe_allow_html=True)
+        login_tab, signup_tab = st.tabs(["🔐 Login", "🆕 Create Account"])
 
-            login_tab, signup_tab = st.tabs(["🔐 Login", "🆕 Create Account"])
+        with login_tab:
+            email = st.text_input("Email", key="login_email", placeholder="you@example.com")
+            password = st.text_input("Password", type="password", key="login_password", placeholder="Enter your password")
 
-            with login_tab:
-                email = st.text_input("Email", key="login_email", placeholder="you@example.com")
-                password = st.text_input("Password", type="password", key="login_password", placeholder="Enter your password")
+            if st.button("Login", use_container_width=True, type="primary", key="login_btn"):
+                try:
+                    result = supabase.auth.sign_in_with_password(
+                        {"email": email.strip(), "password": password}
+                    )
+                    if getattr(result, "user", None):
+                        st.success("Login successful")
+                        st.rerun()
+                    else:
+                        st.error("Login failed.")
+                except Exception as e:
+                    st.error(f"Login error: {e}")
 
-                if st.button("Login", use_container_width=True, type="primary", key="login_btn"):
-                    try:
-                        result = supabase.auth.sign_in_with_password(
-                            {"email": email.strip(), "password": password}
-                        )
-                        if getattr(result, "user", None):
-                            signed_user = getattr(result, "user", None)
-                            st.session_state["trade_easy_login_user_id"] = str(getattr(signed_user, "id", ""))
-                            st.session_state["trade_easy_login_user_email"] = str(getattr(signed_user, "email", "") or "")
-                            st.success("Login successful")
-                            st.rerun()
-                        else:
-                            st.error("Login failed.")
-                    except Exception as e:
-                        st.error(f"Login error: {e}")
-
-                forgot_left, forgot_col, forgot_right = st.columns([1, 1.35, 1])
-                with forgot_col:
-                    if st.button("Forgot Password?", use_container_width=True, key="forgot_password_btn"):
-                        if not email.strip():
-                            st.warning("पहले अपना email address डालें।")
-                        else:
-                            try:
-                                password_reset_url = f"{TRADE_EASY_PUBLIC_URL.rstrip('/')}/?reset_password=1"
-                                supabase.auth.reset_password_for_email(
-                                    email.strip(),
-                                    {"redirect_to": password_reset_url},
-                                )
-                                st.success("Password reset link भेज दिया गया है। Email खोलें और नया password सेट करें।")
-                            except Exception as e:
-                                st.error(f"Password reset error: {e}")
+            forgot_left, forgot_col, forgot_right = st.columns([1, 1.35, 1])
+            with forgot_col:
+                if st.button("Forgot Password?", use_container_width=True, key="forgot_password_btn"):
+                    if not email.strip():
+                        st.warning("पहले अपना email address डालें।")
+                    else:
+                        try:
+                            password_reset_url = f"{TRADE_EASY_PUBLIC_URL.rstrip('/')}/?reset_password=1"
+                            supabase.auth.reset_password_for_email(
+                                email.strip(),
+                                {"redirect_to": password_reset_url},
+                            )
+                            st.success("Password reset link भेज दिया गया है। Email खोलें और नया password सेट करें।")
+                        except Exception as e:
+                            st.error(f"Password reset error: {e}")
 
 
-            with signup_tab:
-                name = st.text_input("Name", key="signup_name", placeholder="Your name")
-                email = st.text_input("Email", key="signup_email", placeholder="you@example.com")
-                password = st.text_input("Password", type="password", key="signup_password", placeholder="Create a password")
+        with signup_tab:
+            name = st.text_input("Name", key="signup_name", placeholder="Your name")
+            email = st.text_input("Email", key="signup_email", placeholder="you@example.com")
+            password = st.text_input("Password", type="password", key="signup_password", placeholder="Create a password")
 
+            if st.button("Create Account", use_container_width=True, type="primary", key="signup_btn"):
+                try:
+                    result = supabase.auth.sign_up(
+                        {
+                            "email": email.strip(),
+                            "password": password,
+                            "options": {
+                                "data": {
+                                    "display_name": name.strip(),
+                                    "full_name": name.strip(),
+                                }
+                            },
+                        }
+                    )
+                    new_user = getattr(result, "user", None)
+                    if new_user:
+                        # Start the one-time 7-day trial as soon as the account is created.
+                        try:
+                            ensure_trial_subscription(getattr(new_user, "id", ""))
+                        except Exception:
+                            pass
+                        st.success("Account created. आपका 7-day Free Trial शुरू हो गया है। अगर email confirmation enabled है तो पहले email confirm करें।")
+                    else:
+                        st.error("Account creation failed.")
+                except Exception as e:
+                    st.error(f"Signup error: {e}")
 
-                if st.button("Create Account", use_container_width=True, type="primary", key="signup_btn"):
-                    try:
-                        result = supabase.auth.sign_up(
-                            {
-                                "email": email.strip(),
-                                "password": password,
-                                "options": {
-                                    "data": {
-                                        "display_name": name.strip(),
-                                        "full_name": name.strip(),
-                                    }
-                                },
-                            }
-                        )
-                        new_user = getattr(result, "user", None)
-                        if new_user:
-                            # Start the one-time 7-day trial as soon as the account is created.
-                            try:
-                                ensure_trial_subscription(getattr(new_user, "id", ""))
-                            except Exception:
-                                pass
-                            st.success("Account created. आपका 7-day Free Trial शुरू हो गया है। अगर email confirmation enabled है तो पहले email confirm करें।")
-                        else:
-                            st.error("Account creation failed.")
-                    except Exception as e:
-                        st.error(f"Signup error: {e}")
+        st.markdown('<div class="te-auth-caption">Secure authentication • Trade Easy</div>', unsafe_allow_html=True)
 
-            st.markdown(
-                '<div style="text-align:center;color:#64748b;font-size:11px;margin:10px 0 6px;">or continue with Google</div>',
-                unsafe_allow_html=True,
-            )
-            google_result = render_google_gsi("main")
-            if handle_google_gsi_result(google_result, "main"):
-                st.success("Google sign-in successful")
-                st.rerun()
-
-            st.markdown('<div class="te-auth-caption">Google से नया user account बने तो वही 7-day Free Trial लागू होगा.</div>', unsafe_allow_html=True)
 
 # ============================================================
 # DATA LAYER
@@ -4048,21 +3803,6 @@ def dashboard(user, workspace):
     st.markdown("""
     <style>
     /* ========================================================
-       TRADE EASY — DASHBOARD RESET
-       Explicitly undo any login-only column rules that may remain in the
-       browser DOM for one rerun after authentication.
-       ======================================================== */
-    .stApp .stHorizontalBlock {
-        max-width: 100% !important;
-        margin-left: 0 !important;
-        margin-right: 0 !important;
-    }
-    .stApp .stHorizontalBlock > div[data-testid="column"] {
-        display: block !important;
-        max-width: none !important;
-    }
-
-    /* ========================================================
        TRADE EASY — VISUAL CLARITY LAYER
        UI only: no trading/data logic is changed here.
        ======================================================== */
@@ -4903,8 +4643,8 @@ def dashboard(user, workspace):
             st.session_state["fyers_app_id"] = active_app_id
     
         if not active_app_id:
-            st.session_state["trade_easy_strategy_error"] = "FYERS App ID not configured; dashboard is running in display-only mode."
-            return
+            st.info("Live market connection is currently unavailable. Last available dashboard data is retained.")
+            st.stop()
     
         # Completed-candle history changes only when the selected timeframe closes.
         # During market close, a single cached snapshot is enough.
@@ -5659,17 +5399,12 @@ def dashboard(user, workspace):
     
 
     # Invisible strategy polling fragment: it writes to strategy_root only when
-    # a new confirmed strategy or paper-trade event is detected. A runtime/version
-    # mismatch must never prevent the static dashboard from opening.
-    try:
-        if hasattr(st, "fragment"):
-            _render_full_dashboard = st.fragment(
-                run_every="1s", key="trade_easy_strategy_dashboard"
-            )(_render_full_dashboard)
-        _render_full_dashboard()
-    except Exception as exc:
-        st.session_state["trade_easy_strategy_error"] = f"Live dashboard refresh: {type(exc).__name__}: {exc}"
-        st.warning("Dashboard खुल गया है; live strategy refresh अभी उपलब्ध नहीं है।")
+    # a new confirmed strategy or paper-trade event is detected.
+    if hasattr(st, "fragment"):
+        _render_full_dashboard = st.fragment(
+            run_every="1s", key="trade_easy_strategy_dashboard"
+        )(_render_full_dashboard)
+    _render_full_dashboard()
 
 # ============================================================
 # PASSWORD RECOVERY: DEFAULT SUPABASE EMAIL (NO CUSTOM SMTP)
@@ -5895,17 +5630,14 @@ def main():
 
     if oauth_error:
         clear_oauth_params()
-        st.error(f"Google login failed: {oauth_error_description or oauth_error}")
+        st.error(f"Authentication failed: {oauth_error_description or oauth_error}")
         st.stop()
 
     # ------------------------------------------------------------
     # PASSWORD RECOVERY CALLBACK
     # ------------------------------------------------------------
-    # IMPORTANT: Handle the password-reset callback BEFORE the normal
-    # Google OAuth callback. Supabase sends the reset code back to the
-    # deployed app; if the generic oauth_code block consumes it first,
-    # the user is returned to the normal Login page instead of seeing
-    # the Set New Password screen.
+    # IMPORTANT: Handle the password-reset callback before any generic OAuth
+    # handling so the user is returned to the Set New Password screen.
     reset_requested = (
         st.query_params.get("reset_password") == "1"
         or str(recovery_type or "").lower() == "recovery"
@@ -6003,37 +5735,8 @@ def main():
             st.error(f"Password reset callback error: {type(e).__name__}: {e}")
             st.stop()
 
-    # ------------------------------------------------------------
-    # NORMAL GOOGLE OAUTH CALLBACK
-    # ------------------------------------------------------------
-    if oauth_code and user is None and not reset_requested:
-        try:
-            response = supabase.auth.exchange_code_for_session(
-                {"auth_code": oauth_code}
-            )
-
-            if getattr(response, "user", None) is not None:
-                clear_oauth_params()
-                st.rerun()
-
-            user = get_current_user()
-            if user is not None:
-                clear_oauth_params()
-                st.rerun()
-
-            clear_oauth_params()
-            st.error("Google login completed, but session was not found.")
-            st.stop()
-
-        except Exception as e:
-            user_after_error = get_current_user()
-            if user_after_error is not None:
-                clear_oauth_params()
-                st.rerun()
-
-            clear_oauth_params()
-            st.error(f"Google login callback error: {e}")
-            st.stop()
+    # No normal OAuth provider callback is handled here.
+    # `oauth_code` remains reserved for the password-recovery PKCE flow above.
 
     if st.session_state.get("password_recovery"):
         if user is None:
@@ -6114,12 +5817,7 @@ def main():
         subscription_block_page(subscription, user)
         return
 
-    try:
-        dashboard(user, workspace)
-    except Exception as exc:
-        st.error("Dashboard render में error आया, लेकिन login session सही है।")
-        st.code(f"{type(exc).__name__}: {exc}")
-        st.info("Dashboard का static हिस्सा सुरक्षित रखने के लिए live/optional section को अलग किया गया है।")
+    dashboard(user, workspace)
 
 
 if __name__ == "__main__":
