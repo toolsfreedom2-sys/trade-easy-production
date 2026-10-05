@@ -157,10 +157,15 @@ LIVE_TICK_MAX_AGE_SECONDS = 3.0
 
 # UI display cadence: boxes stay mounted; only live values are refreshed.
 DASHBOARD_DISPLAY_TICK_INTERVAL_SECONDS = 1.0
+# CPU protection: only the lightweight live ticker runs every second.
+# Heavy table/strategy renders use their own slower cadence while their boxes
+# remain mounted and stable.
+OPTION_CHAIN_DISPLAY_INTERVAL_SECONDS = 3.0
+STRATEGY_DISPLAY_INTERVAL_SECONDS = 5.0
 
 QUOTE_FALLBACK_INTERVAL_SECONDS = 2.0
 VIX_REFRESH_INTERVAL_SECONDS = 5.0
-HISTORY_REFRESH_INTERVAL_SECONDS = 10.0
+HISTORY_REFRESH_INTERVAL_SECONDS = 20.0
 
 
 
@@ -4486,7 +4491,7 @@ def dashboard(user, workspace):
             unsafe_allow_html=True,
         )
 
-    @st.fragment(run_every=DASHBOARD_DISPLAY_TICK_INTERVAL_SECONDS, key="trade_easy_option_chain")
+    @st.fragment(run_every=OPTION_CHAIN_DISPLAY_INTERVAL_SECONDS, key="trade_easy_option_chain")
     def _render_live_option_chain():
         with option_chain_root:
             market_live, session_label = india_market_status()
@@ -4507,7 +4512,7 @@ def dashboard(user, workspace):
                 chain_df, chain_err = cached_df, None
                 if chain_df is None or chain_df.empty:
                     try:
-                        chain_df, chain_err = option_chain_snapshot(token, appid, symbol, min_interval=5.0)
+                        chain_df, chain_err = option_chain_snapshot(token, appid, symbol, min_interval=8.0)
                     except Exception as exc:
                         chain_err = str(exc)
                 chain_live_price = st.session_state.get("trade_easy_live_price_cached")
@@ -4523,7 +4528,7 @@ def dashboard(user, workspace):
             if chain_live_price is None:
                 chain_live_price = st.session_state.get("trade_easy_live_price_cached")
 
-            chain_df, chain_err = option_chain_snapshot(token, appid, symbol, min_interval=5.0)
+            chain_df, chain_err = option_chain_snapshot(token, appid, symbol, min_interval=8.0)
             option_ticks = fyers_option_live_feed(token, appid, chain_df)
             chain_df = merge_option_ticks(chain_df, option_ticks)
             if chain_df is None or chain_df.empty:
@@ -5560,7 +5565,7 @@ def dashboard(user, workspace):
 
     if hasattr(st, "fragment"):
         _render_full_dashboard_fragment = st.fragment(
-            run_every=DASHBOARD_DISPLAY_TICK_INTERVAL_SECONDS, key="trade_easy_strategy_dashboard"
+            run_every=STRATEGY_DISPLAY_INTERVAL_SECONDS, key="trade_easy_strategy_dashboard"
         )(_render_full_dashboard_target)
         _render_full_dashboard_fragment()
     else:
