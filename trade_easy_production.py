@@ -1237,6 +1237,7 @@ def _make_live_ws_state():
         "latest": None,
         "last_tick_price": None,
         "last_tick_received": None,
+        "requested_symbol": None,
         "last_tick_symbol": None,
         "tick_count": 0,
         "connected": False,
@@ -1293,8 +1294,14 @@ def fyers_live_feed(access_token, app_id, symbol):
         symbol_from_message = None
         if isinstance(message, dict):
             symbol_from_message = message.get("symbol") or message.get("n")
+        # This socket is dedicated to ONE requested index symbol. Ignore any
+        # accidental cross-symbol payload so an option LTP can never overwrite
+        # the index LTP shown in the Market Data / Strategy cards.
+        if symbol_from_message and str(symbol_from_message).strip() != symbol:
+            return
         with lock:
             state["latest"] = message
+            state["requested_symbol"] = symbol
             if symbol_from_message:
                 state["last_tick_symbol"] = str(symbol_from_message)
             state["tick_count"] = int(state.get("tick_count", 0)) + 1
@@ -4179,75 +4186,9 @@ def dashboard(user, workspace):
     # This root is created BEFORE Option Chain/V2 so the full strategy section
     # has a stable place in the page. The live strategy fragment later updates
     # this same root; it never creates a second copy.
-    strategy_root = st.empty()
-
-    def _render_strategy_placeholder():
-        with strategy_root.container():
-            st.markdown('<div class="section-head">Trade Easy Strategy Dashboard</div>', unsafe_allow_html=True)
-            
-            q1, q2, q3, q4, q5 = st.columns(5)
-            q1.metric("Last Signal", "WAITING")
-            q2.metric("Direction", "—")
-            q3.metric("Score", "—")
-            q4.metric("HTF Bias", "—")
-            q5.metric("Structure", "—")
-
-            st.markdown('<div class="section-head">Entry Confirmation</div>', unsafe_allow_html=True)
-            q1, q2, q3, q4 = st.columns(4)
-            q1.metric("Entry Score", "—")
-            q2.metric("PA Confirmations", "—")
-            q3.metric("5/8 EMA", "WAITING")
-            q4.metric("Entry Alert", "—")
-
-            st.markdown('<div class="section-head">5/8 EMA Momentum Filter</div>', unsafe_allow_html=True)
-            q1, q2, q3, q4, q5 = st.columns(5)
-            q1.metric("EMA 5", "—")
-            q2.metric("EMA 8", "—")
-            q3.metric("Spread", "—")
-            q4.metric("Trend", "WAITING")
-            q5.metric("Cross", "—")
-
-            st.markdown('<div class="section-head">Swing / Level Engine</div>', unsafe_allow_html=True)
-            q1, q2, q3, q4, q5 = st.columns(5)
-            q1.metric("Trend", "—")
-            q2.metric("Setup", "WAITING")
-            q3.metric("Type", "—")
-            q4.metric("Clear Path", "—")
-            q5.metric("50-Point Swing", "WAITING")
-
-            st.markdown('<div class="section-head">Market Snapshot</div>', unsafe_allow_html=True)
-            q1, q2, q3, q4, q5, q6 = st.columns(6)
-            q1.metric("Score", "—")
-            q2.metric("HTF Bias", "—")
-            q3.metric("Structure", "—")
-            q4.metric("RSI", "—")
-            q5.metric("ATR", "—")
-            q6.metric("5/8 EMA", "WAITING")
-
-            st.markdown('<div class="section-head">Phase-1 Risk Controls</div>', unsafe_allow_html=True)
-            q1, q2, q3, q4, q5 = st.columns(5)
-            q1.metric("ADX", "—")
-            q2.metric("Session", "WAITING")
-            q3.metric("Entry Distance", "—")
-            q4.metric("Setup Age", "—")
-            q5.metric("Paper Risk", "WAITING")
-
-            st.markdown('<div class="section-head">Phase-2 Paper Execution</div>', unsafe_allow_html=True)
-            q1, q2, q3, q4 = st.columns(4)
-            q1.metric("Paper Position", "FLAT")
-            q2.metric("Trades Today", "0/1")
-            q3.metric("Realized P&L", "₹0.00")
-            q4.metric("Unrealized P&L", "₹0.00")
-
-            st.markdown('<div class="section-head">Phase-3 Monitoring & Audit</div>', unsafe_allow_html=True)
-            q1, q2, q3, q4 = st.columns(4)
-            q1.metric("Paper Engine", "RUNNING")
-            q2.metric("Last Live Price", "—")
-            q3.metric("Audit Events", "0")
-            q4.metric("Paper P&L", "₹0.00")
-
-    _render_strategy_placeholder()
-
+    # The live Strategy Dashboard is rendered directly inside its own Streamlit
+    # fragment later in this function. Keeping an external st.empty() root and
+    # mutating it from a fragment causes LayoutContextError on Streamlit Cloud.
     with st.sidebar:
         st.header("Configuration")
         if st.button("💳 Upgrade / Subscribe", use_container_width=True, key="open_upgrade_subscription"):
@@ -4320,8 +4261,14 @@ def dashboard(user, workspace):
 
         if market_live and token and appid:
             live = fyers_live_feed(token, appid, sym)
-            px = parse_live_price(live.get("latest")) or live.get("last_tick_price")
-            tick_received = live.get("last_tick_received")
+            tick_symbol = str(live.get("last_tick_symbol") or "").strip()
+            valid_tick = (not tick_symbol) or tick_symbol == sym
+            px = None
+            if valid_tick:
+                px = parse_live_price(live.get("latest"))
+                if px is None:
+                    px = live.get("last_tick_price")
+            tick_received = live.get("last_tick_received") if valid_tick else None
             tick_age = (time.time() - float(tick_received)) if tick_received else None
             ws_status = str(live.get("status") or ("CONNECTED" if live.get("connected") else "RECONNECTING"))
             ws_error = live.get("error")
@@ -4330,20 +4277,24 @@ def dashboard(user, workspace):
             # missing/stale. This prevents a blank LTP when the socket is still
             # reconnecting, while preserving the WebSocket as the primary feed.
             if px is None or tick_age is None or tick_age > LIVE_TICK_MAX_AGE_SECONDS:
-                last_quote_at = float(st.session_state.get("trade_easy_ticker_quote_at", 0.0))
+                quote_at = st.session_state.setdefault("trade_easy_ticker_quote_at_by_symbol", {})
+                quote_px_cache = st.session_state.setdefault("trade_easy_ticker_quote_price_by_symbol", {})
+                quote_err_cache = st.session_state.setdefault("trade_easy_ticker_quote_error_by_symbol", {})
+                last_quote_at = float(quote_at.get(sym, 0.0))
                 if time.time() - last_quote_at >= QUOTE_FALLBACK_INTERVAL_SECONDS:
                     qpx, qerr = fyers_fetch_quote(token, appid, sym)
-                    st.session_state["trade_easy_ticker_quote_at"] = time.time()
-                    st.session_state["trade_easy_ticker_quote_error"] = qerr
+                    quote_at[sym] = time.time()
+                    quote_err_cache[sym] = qerr
                     if qpx is not None:
-                        st.session_state["trade_easy_ticker_quote_price"] = float(qpx)
+                        quote_px_cache[sym] = float(qpx)
                         px = float(qpx)
                 else:
-                    px = st.session_state.get("trade_easy_ticker_quote_price", px)
-            quote_error = st.session_state.get("trade_easy_ticker_quote_error")
+                    px = quote_px_cache.get(sym, px)
+            quote_error = st.session_state.setdefault("trade_easy_ticker_quote_error_by_symbol", {}).get(sym)
 
             if px is not None:
                 px = float(px)
+                st.session_state.setdefault("trade_easy_live_price_by_symbol", {})[sym] = px
                 st.session_state["trade_easy_live_price_cached"] = px
                 st.session_state["trade_easy_live_price_rendered"] = True
 
@@ -4354,7 +4305,9 @@ def dashboard(user, workspace):
             ws_status = session_label
             # Outside cash-market hours, keep only the last known quote. Do not
             # run a continuous broker refresh loop.
-            px = st.session_state.get("trade_easy_live_price_cached")
+            px = st.session_state.setdefault("trade_easy_live_price_by_symbol", {}).get(sym)
+            if px is None:
+                px = st.session_state.get("trade_easy_live_price_cached")
         else:
             ws_status = "CONFIG_ERROR"
             ws_error = "FYERS session is not connected."
@@ -4445,9 +4398,9 @@ def dashboard(user, workspace):
             )
 
         # Keep the latest health state available to the strategy fragment.
-        st.session_state["trade_easy_live_price_cached"] = (
-            float(px) if px is not None else st.session_state.get("trade_easy_live_price_cached")
-        )
+        if px is not None:
+            st.session_state.setdefault("trade_easy_live_price_by_symbol", {})[sym] = float(px)
+            st.session_state["trade_easy_live_price_cached"] = float(px)
         st.session_state["trade_easy_ws_status"] = ws_status
         st.session_state["trade_easy_ticker_quote_error"] = quote_error
         st.session_state["trade_easy_data_health_ticker"] = {
@@ -4583,79 +4536,11 @@ def dashboard(user, workspace):
     # during market-close/WAIT states where the fragment intentionally returns
     # early. Live values are still updated from the same engine when available.
     # ------------------------------------------------------------
-    v2_root = st.empty()
-    with v2_root.container():
-        _v2_cached_result = st.session_state.get("trade_easy_v2_result") or {}
-        _v2_cached_tfs = st.session_state.get("trade_easy_v2_timeframes") or {15:{}, 30:{}, 60:{}}
-        _v2_cached_oi = st.session_state.get("trade_easy_v2_oi_history") or {}
-        render_trade_finder_v2(_v2_cached_result, _v2_cached_tfs, _v2_cached_oi)
-
-    # Permanent dashboard shell. Cards are always visible and are populated with
-    # the last completed-candle / last-known strategy snapshot whenever available.
-    # This shell is updated only when the strategy snapshot itself changes; live
-    # price has its own tiny ticker fragment and does not repaint these cards.
-    # Separate render roots are mandatory: permanent cards must never be
-    # replaced/cleared by the detailed live strategy output.
-    # strategy_root was created above the Option Chain and is the single stable
-    # location for all strategy cards. Never create another strategy root here.
-    strategy_detail_root = st.empty()
-    with strategy_detail_root.container():
-        st.markdown('<div class="section-head">🧩 Detailed Logic / Confirmation Output</div>', unsafe_allow_html=True)
-        st.caption("यह पूरा decision layer हमेशा दिखाई देगा। Live/completed-candle data उपलब्ध होने पर values इसी स्थान पर अपडेट होंगी।")
-        d1, d2, d3, d4 = st.columns(4)
-        d1.metric("Logic State", "WAITING")
-        d2.metric("Entry", "—")
-        d3.metric("Stop Loss", "—")
-        d4.metric("Target", "—")
-
-        st.markdown('<div class="section-head">🗺️ Paper Entry / Exit Map</div>', unsafe_allow_html=True)
-        p1, p2, p3, p4, p5 = st.columns(5)
-        p1.metric("Entry Price", "—")
-        p2.metric("Live Price", "—")
-        p3.metric("Stop Loss", "—")
-        p4.metric("Target", "—")
-        p5.metric("Quantity", PAPER_FIXED_QUANTITY)
-        st.caption("WAITING — validated direction/setup के बाद entry, SL और target भरेंगे।")
-
-        st.markdown('<div class="section-head">📣 Signal Output</div>', unsafe_allow_html=True)
-        s1, s2, s3, s4 = st.columns(4)
-        s1.metric("Direction", "—")
-        s2.metric("Signal", "WAITING")
-        s3.metric("Risk / Reward", "—")
-        s4.metric("Quantity", PAPER_FIXED_QUANTITY)
-
-        st.markdown('<div class="section-head">🔎 Mandatory Checks</div>', unsafe_allow_html=True)
-        check_shell = pd.DataFrame([
-            {"Check": "Data validation", "Status": "WAITING"},
-            {"Check": "Completed candle", "Status": "WAITING"},
-            {"Check": "Stale-data check", "Status": "WAITING"},
-            {"Check": "Risk checks", "Status": "WAITING"},
-            {"Check": "Minimum RR", "Status": "WAITING"},
-            {"Check": "5/8 EMA confirmation", "Status": "WAITING"},
-            {"Check": "Duplicate protection", "Status": "WAITING"},
-        ])
-        st.dataframe(check_shell, use_container_width=True, hide_index=True)
-
-        st.markdown('<div class="section-head">🧱 Key Levels</div>', unsafe_allow_html=True)
-        level_shell = pd.DataFrame([
-            {"Level": x, "Value": "—"}
-            for x in ["Previous Day High", "Previous Day Low", "VWAP", "Swing High", "Swing Low", "Support", "Resistance"]
-        ])
-        st.dataframe(level_shell, use_container_width=True, hide_index=True)
-
-        st.markdown('<div class="section-head">📝 Reasons / Invalidations</div>', unsafe_allow_html=True)
-        r1, r2 = st.columns(2)
-        r1.info("WAITING FOR MARKET DATA — reason codes will appear here.")
-        r2.info("WAITING FOR MARKET DATA — invalidations/blocks will appear here.")
-
-        st.markdown('<div class="section-head">🕯️ Validated Candle Data</div>', unsafe_allow_html=True)
-        candle_shell = pd.DataFrame([{
-            "Timestamp":"—", "Open":"—", "High":"—", "Low":"—", "Close":"—",
-            "Volume":"—", "VWAP":"—", "EMA 5":"—", "EMA 8":"—",
-            "RSI":"—", "MACD":"—", "ATR":"—", "ADX":"—"
-        }])
-        st.dataframe(candle_shell, use_container_width=True, hide_index=True)
-
+    # Trade Finder V2 and detailed confirmation panels are rendered directly
+    # inside the live strategy fragment. They do not write into external
+    # st.empty() containers, preventing fragment layout-context errors.
+    # Live strategy cards + detailed logic are rendered directly by the
+    # live strategy fragment below so their numbers can update continuously.
     def _render_strategy_cards(snapshot=None):
         snap = snapshot or {}
         paper = snap.get("paper", {}) or {}
@@ -4674,109 +4559,108 @@ def dashboard(user, workspace):
         last_label = "LAST DATA" if snapshot else "WAITING FOR DATA"
         status_text = "CONFIRMED" if strategy_confirmed else "LAST SNAPSHOT / WAITING"
 
-        with strategy_root.container():
-            health = snap.get("data_health", {}) or {}
-            st.markdown('<div class="section-head">📡 Market Data Health</div>', unsafe_allow_html=True)
-            h1, h2, h3, h4, h5 = st.columns(5)
-            h1.metric("WebSocket", health.get("status", "WAITING"))
-            h2.metric("Live LTP", f"₹{float(health['live_price']):,.2f}" if health.get("live_price") is not None else "—")
-            h3.metric("Tick Age", f"{float(health['tick_age']):.1f}s" if health.get("tick_age") is not None else "—")
-            h4.metric("Ticks", int(health.get("tick_count", 0)))
-            h5.metric("History", "READY" if not health.get("history_warning") else "ERROR")
-            if health.get("ws_error"):
-                st.warning(f"WebSocket: {health.get('ws_error')}")
-            if health.get("quote_error") and health.get("live_price") is None:
-                st.error(f"Quotes fallback: {health.get('quote_error')}")
-            if health.get("history_warning"):
-                st.warning(f"History: {health.get('history_warning')}")
+        health = snap.get("data_health", {}) or {}
+        st.markdown('<div class="section-head">📡 Market Data Health</div>', unsafe_allow_html=True)
+        h1, h2, h3, h4, h5 = st.columns(5)
+        h1.metric("WebSocket", health.get("status", "WAITING"))
+        h2.metric("Live LTP", f"₹{float(health['live_price']):,.2f}" if health.get("live_price") is not None else "—")
+        h3.metric("Tick Age", f"{float(health['tick_age']):.1f}s" if health.get("tick_age") is not None else "—")
+        h4.metric("Ticks", int(health.get("tick_count", 0)))
+        h5.metric("History", "READY" if not health.get("history_warning") else "ERROR")
+        if health.get("ws_error"):
+            st.warning(f"WebSocket: {health.get('ws_error')}")
+        if health.get("quote_error") and health.get("live_price") is None:
+            st.error(f"Quotes fallback: {health.get('quote_error')}")
+        if health.get("history_warning"):
+            st.warning(f"History: {health.get('history_warning')}")
 
-            st.markdown('<div class="section-head">Trade Easy Strategy Dashboard</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-head">Trade Easy Strategy Dashboard</div>', unsafe_allow_html=True)
+        st.caption(
+            f"Dashboard Cards / Panels हमेशा दिखाई देंगे • {last_label} • "
+            f"Completed candle: {asof} • Evaluated: {evaluated_at}"
+        )
+        st.caption(
+            f"Strategy status: **{status_text}** • Market: {snap.get('session_label', '—')} • "
+            f"Live price/indicator numbers refresh every second; trade direction/signal remains based on the last completed candle."
+        )
+
+        s1, s2, s3, s4, s5 = st.columns(5)
+        s1.metric("Last Signal", signal)
+        s2.metric("Direction", direction)
+        s3.metric("Score", f"{score}" if score is not None else "—")
+        s4.metric("HTF Bias", bias)
+        s5.metric("Structure", structure)
+
+        st.markdown('<div class="section-head">Entry Confirmation</div>', unsafe_allow_html=True)
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Entry Score", f"{score}/75" if score is not None else "—")
+        s2.metric("PA Confirmations", f"{snap.get('confirmation_count', 0)}/2" if snapshot else "—")
+        s3.metric("5/8 EMA", "PASS" if ema_state.get("confirmed") else ("WAIT" if snapshot else "WAITING"))
+        s4.metric("Entry Alert", "YES" if snap.get("entry_alert") else ("NO" if snapshot else "—"))
+
+        st.markdown('<div class="section-head">5/8 EMA Momentum Filter</div>', unsafe_allow_html=True)
+        s1, s2, s3, s4, s5 = st.columns(5)
+        s1.metric("EMA 5", f"{snap['ema_5']:,.2f}" if snap.get("ema_5") is not None else "—")
+        s2.metric("EMA 8", f"{snap['ema_8']:,.2f}" if snap.get("ema_8") is not None else "—")
+        s3.metric("Spread", f"{snap['ema_spread']:+,.2f}" if snap.get("ema_spread") is not None else "—")
+        s4.metric("Trend", ema_state.get("trend", "—"))
+        s5.metric("Cross", ema_state.get("cross", "—"))
+
+        st.markdown('<div class="section-head">Swing / Level Engine</div>', unsafe_allow_html=True)
+        s1, s2, s3, s4, s5 = st.columns(5)
+        s1.metric("Trend", bias)
+        s2.metric("Setup", level_setup.get("status", "WAITING") if snapshot else "WAITING")
+        s3.metric("Type", level_setup.get("trade_type", "—"))
+        clear_pts = path.get("clear_path")
+        raw_pts = path.get("raw_distance")
+        s4.metric("Clear Path", f"{clear_pts:.1f} pts" if isinstance(clear_pts, (int, float)) and np.isfinite(clear_pts) else "—")
+        swing50 = bool(snap.get("clear_path_50_pass", False)) if snapshot else False
+        s5.metric("50-Point Swing", "PASS" if swing50 else ("WAIT" if snapshot else "WAITING"))
+        if isinstance(raw_pts, (int, float)) and np.isfinite(raw_pts):
+            st.caption(f"Raw distance: {raw_pts:.1f} pts • required meaningful move: {snap.get('meaningful_move_points', '—')} pts")
+
+        st.markdown('<div class="section-head">Market Snapshot</div>', unsafe_allow_html=True)
+        s1, s2, s3, s4, s5, s6 = st.columns(6)
+        s1.metric("Score", f"{score}" if score is not None else "—")
+        s2.metric("HTF Bias", bias)
+        s3.metric("Structure", structure)
+        s4.metric("RSI", f"{snap['rsi']:.1f}" if snap.get("rsi") is not None else "—")
+        s5.metric("ATR", f"{snap['atr']:.2f}" if snap.get("atr") is not None else "—")
+        s6.metric("5/8 EMA", ema_state.get("trend", "—"))
+
+        st.markdown('<div class="section-head">Phase-1 Risk Controls</div>', unsafe_allow_html=True)
+        s1, s2, s3, s4, s5 = st.columns(5)
+        adx_val = snap.get("adx")
+        trig_atr = snap.get("trigger_distance_atr")
+        setup_age = snap.get("setup_age")
+        risk_ok = snap.get("risk_ok")
+        s1.metric("ADX", f"{adx_val:.1f}" if adx_val is not None else "—")
+        s2.metric("Session", "OPEN" if not session_failures else (snap.get("session_label", "BLOCKED")))
+        s3.metric("Entry Distance", f"{trig_atr:.2f} ATR" if trig_atr is not None else "—")
+        s4.metric("Setup Age", str(setup_age) if setup_age is not None else "—")
+        s5.metric("Paper Risk", "PASS" if risk_ok else ("BLOCKED" if snapshot else "—"))
+
+        st.markdown('<div class="section-head">Phase-2 Paper Execution</div>', unsafe_allow_html=True)
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Paper Position", "OPEN" if paper.get("open_position") else "FLAT")
+        s2.metric("Trades Today", str(paper.get("trades_today", 0)))
+        s3.metric("Realized P&L", f"₹{float(paper.get('daily_realized_pnl', 0.0)):,.2f}")
+        s4.metric("Unrealized P&L", f"₹{float(paper.get('unrealized_pnl', 0.0)):,.2f}")
+
+        st.markdown('<div class="section-head">Phase-3 Monitoring & Audit</div>', unsafe_allow_html=True)
+        st.caption("🟢 LOGIC ACTIVE — monitoring/audit remains visible continuously." if not paper.get("paper_kill_switch") else "🔴 LOGIC PAUSED — paper kill switch is active; audit remains visible.")
+        s1, s2, s3, s4 = st.columns(4)
+        s1.metric("Paper Engine", "KILLED" if paper.get("paper_kill_switch") else "RUNNING")
+        s2.metric("Last Live Price", f"₹{snap['live_price']:,.2f}" if snap.get("live_price") is not None else "—")
+        s3.metric("Audit Events", str(paper.get("audit_events", 0)))
+        total_pnl = float(paper.get("daily_realized_pnl", 0.0)) + float(paper.get("unrealized_pnl", 0.0))
+        s4.metric("Paper P&L", f"₹{total_pnl:,.2f}")
+
+        if snapshot:
             st.caption(
-                f"Dashboard Cards / Panels हमेशा दिखाई देंगे • {last_label} • "
-                f"Completed candle: {asof} • Evaluated: {evaluated_at}"
+                "📌 Last data source: completed candle + latest cached strategy calculation. "
+                "Live price is displayed separately and is not used to repaint these cards on every tick."
             )
-            st.caption(
-                f"Strategy status: **{status_text}** • Market: {snap.get('session_label', '—')} • "
-                f"Last-known values stay unchanged until a new completed-candle/event update arrives."
-            )
-
-            s1, s2, s3, s4, s5 = st.columns(5)
-            s1.metric("Last Signal", signal)
-            s2.metric("Direction", direction)
-            s3.metric("Score", f"{score}" if score is not None else "—")
-            s4.metric("HTF Bias", bias)
-            s5.metric("Structure", structure)
-
-            st.markdown('<div class="section-head">Entry Confirmation</div>', unsafe_allow_html=True)
-            s1, s2, s3, s4 = st.columns(4)
-            s1.metric("Entry Score", f"{score}/75" if score is not None else "—")
-            s2.metric("PA Confirmations", f"{snap.get('confirmation_count', 0)}/2" if snapshot else "—")
-            s3.metric("5/8 EMA", "PASS" if ema_state.get("confirmed") else ("WAIT" if snapshot else "WAITING"))
-            s4.metric("Entry Alert", "YES" if snap.get("entry_alert") else ("NO" if snapshot else "—"))
-
-            st.markdown('<div class="section-head">5/8 EMA Momentum Filter</div>', unsafe_allow_html=True)
-            s1, s2, s3, s4, s5 = st.columns(5)
-            s1.metric("EMA 5", f"{snap['ema_5']:,.2f}" if snap.get("ema_5") is not None else "—")
-            s2.metric("EMA 8", f"{snap['ema_8']:,.2f}" if snap.get("ema_8") is not None else "—")
-            s3.metric("Spread", f"{snap['ema_spread']:+,.2f}" if snap.get("ema_spread") is not None else "—")
-            s4.metric("Trend", ema_state.get("trend", "—"))
-            s5.metric("Cross", ema_state.get("cross", "—"))
-
-            st.markdown('<div class="section-head">Swing / Level Engine</div>', unsafe_allow_html=True)
-            s1, s2, s3, s4, s5 = st.columns(5)
-            s1.metric("Trend", bias)
-            s2.metric("Setup", level_setup.get("status", "WAITING") if snapshot else "WAITING")
-            s3.metric("Type", level_setup.get("trade_type", "—"))
-            clear_pts = path.get("clear_path")
-            raw_pts = path.get("raw_distance")
-            s4.metric("Clear Path", f"{clear_pts:.1f} pts" if isinstance(clear_pts, (int, float)) and np.isfinite(clear_pts) else "—")
-            swing50 = bool(snap.get("clear_path_50_pass", False)) if snapshot else False
-            s5.metric("50-Point Swing", "PASS" if swing50 else ("WAIT" if snapshot else "WAITING"))
-            if isinstance(raw_pts, (int, float)) and np.isfinite(raw_pts):
-                st.caption(f"Raw distance: {raw_pts:.1f} pts • required meaningful move: {snap.get('meaningful_move_points', '—')} pts")
-
-            st.markdown('<div class="section-head">Market Snapshot</div>', unsafe_allow_html=True)
-            s1, s2, s3, s4, s5, s6 = st.columns(6)
-            s1.metric("Score", f"{score}" if score is not None else "—")
-            s2.metric("HTF Bias", bias)
-            s3.metric("Structure", structure)
-            s4.metric("RSI", f"{snap['rsi']:.1f}" if snap.get("rsi") is not None else "—")
-            s5.metric("ATR", f"{snap['atr']:.2f}" if snap.get("atr") is not None else "—")
-            s6.metric("5/8 EMA", ema_state.get("trend", "—"))
-
-            st.markdown('<div class="section-head">Phase-1 Risk Controls</div>', unsafe_allow_html=True)
-            s1, s2, s3, s4, s5 = st.columns(5)
-            adx_val = snap.get("adx")
-            trig_atr = snap.get("trigger_distance_atr")
-            setup_age = snap.get("setup_age")
-            risk_ok = snap.get("risk_ok")
-            s1.metric("ADX", f"{adx_val:.1f}" if adx_val is not None else "—")
-            s2.metric("Session", "OPEN" if not session_failures else (snap.get("session_label", "BLOCKED")))
-            s3.metric("Entry Distance", f"{trig_atr:.2f} ATR" if trig_atr is not None else "—")
-            s4.metric("Setup Age", str(setup_age) if setup_age is not None else "—")
-            s5.metric("Paper Risk", "PASS" if risk_ok else ("BLOCKED" if snapshot else "—"))
-
-            st.markdown('<div class="section-head">Phase-2 Paper Execution</div>', unsafe_allow_html=True)
-            s1, s2, s3, s4 = st.columns(4)
-            s1.metric("Paper Position", "OPEN" if paper.get("open_position") else "FLAT")
-            s2.metric("Trades Today", str(paper.get("trades_today", 0)))
-            s3.metric("Realized P&L", f"₹{float(paper.get('daily_realized_pnl', 0.0)):,.2f}")
-            s4.metric("Unrealized P&L", f"₹{float(paper.get('unrealized_pnl', 0.0)):,.2f}")
-
-            st.markdown('<div class="section-head">Phase-3 Monitoring & Audit</div>', unsafe_allow_html=True)
-            st.caption("🟢 LOGIC ACTIVE — monitoring/audit remains visible continuously." if not paper.get("paper_kill_switch") else "🔴 LOGIC PAUSED — paper kill switch is active; audit remains visible.")
-            s1, s2, s3, s4 = st.columns(4)
-            s1.metric("Paper Engine", "KILLED" if paper.get("paper_kill_switch") else "RUNNING")
-            s2.metric("Last Live Price", f"₹{snap['live_price']:,.2f}" if snap.get("live_price") is not None else "—")
-            s3.metric("Audit Events", str(paper.get("audit_events", 0)))
-            total_pnl = float(paper.get("daily_realized_pnl", 0.0)) + float(paper.get("unrealized_pnl", 0.0))
-            s4.metric("Paper P&L", f"₹{total_pnl:,.2f}")
-
-            if snapshot:
-                st.caption(
-                    "📌 Last data source: completed candle + latest cached strategy calculation. "
-                    "Live price is displayed separately and is not used to repaint these cards on every tick."
-                )
 
     # Do not render strategy cards here: the live strategy fragment owns the
     # single strategy-card render root when a FYERS session is available.
@@ -4839,24 +4723,34 @@ def dashboard(user, workspace):
         # At market close the last cached price is reused and no quote refresh runs.
         if strategy_market_live:
             live_state = fyers_live_feed(access_token, active_app_id, symbol)
-            ws_price = parse_live_price(live_state.get("latest"))
-            tick_received = live_state.get("last_tick_received")
+            tick_symbol = str(live_state.get("last_tick_symbol") or "").strip()
+            valid_tick = (not tick_symbol) or tick_symbol == symbol
+            ws_price = None
+            if valid_tick:
+                ws_price = parse_live_price(live_state.get("latest"))
+                if ws_price is None:
+                    ws_price = live_state.get("last_tick_price")
+            tick_received = live_state.get("last_tick_received") if valid_tick else None
             tick_age = (time.time() - float(tick_received)) if tick_received else None
             quote_price = None
             quote_error = None
             if ws_price is None or tick_age is None or tick_age > LIVE_TICK_MAX_AGE_SECONDS:
-                last_quote_at = float(st.session_state.get("trade_easy_last_quote_at", 0.0))
+                quote_at = st.session_state.setdefault("trade_easy_last_quote_at_by_symbol", {})
+                quote_price_cache = st.session_state.setdefault("trade_easy_last_quote_price_by_symbol", {})
+                last_quote_at = float(quote_at.get(symbol, 0.0))
                 if time.time() - last_quote_at >= QUOTE_FALLBACK_INTERVAL_SECONDS:
                     quote_price, quote_error = fyers_fetch_quote(access_token, active_app_id, symbol)
-                    st.session_state["trade_easy_last_quote_at"] = time.time()
+                    quote_at[symbol] = time.time()
                     if quote_price is not None:
-                        st.session_state["trade_easy_last_quote_price"] = float(quote_price)
+                        quote_price_cache[symbol] = float(quote_price)
                 else:
-                    quote_price = st.session_state.get("trade_easy_last_quote_price")
+                    quote_price = quote_price_cache.get(symbol)
             live_price = ws_price if ws_price is not None else quote_price
         else:
             live_state = {"connected": False, "tick_count": 0}
-            ws_price = st.session_state.get("trade_easy_live_price_cached")
+            ws_price = st.session_state.setdefault("trade_easy_live_price_by_symbol", {}).get(symbol)
+            if ws_price is None:
+                ws_price = st.session_state.get("trade_easy_live_price_cached")
             tick_age = None
             quote_error = None
             live_price = ws_price
@@ -4906,18 +4800,16 @@ def dashboard(user, workspace):
             st.session_state["trade_easy_v2_oi_history"] = option_history_v2
             # Update the permanent V2 root; never let the strategy fragment own
             # the lifetime of this panel.
-            with v2_root:
-                render_trade_finder_v2(v2_result, timeframe_results_v2, option_history_v2)
+            render_trade_finder_v2(v2_result, timeframe_results_v2, option_history_v2)
         except Exception as v2_exc:
             # V2 must never take down the main dashboard. Keep the panel visible.
             st.session_state["trade_easy_v2_error"] = str(v2_exc)
-            with v2_root:
-                render_trade_finder_v2(
-                    st.session_state.get("trade_easy_v2_result") or {},
-                    st.session_state.get("trade_easy_v2_timeframes") or {15:{}, 30:{}, 60:{}},
-                    st.session_state.get("trade_easy_v2_oi_history") or {},
-                )
-                st.warning(f"Trade Finder V2 अभी WAIT mode में है: {v2_exc}")
+            render_trade_finder_v2(
+                st.session_state.get("trade_easy_v2_result") or {},
+                st.session_state.get("trade_easy_v2_timeframes") or {15:{}, 30:{}, 60:{}},
+                st.session_state.get("trade_easy_v2_oi_history") or {},
+            )
+            st.warning(f"Trade Finder V2 अभी WAIT mode में है: {v2_exc}")
 
         if not strategy_market_live:
             st.session_state["trade_easy_closed_strategy_initialized"] = True
@@ -4957,12 +4849,29 @@ def dashboard(user, workspace):
         if df.empty or len(df) < 30:
             st.session_state["trade_easy_strategy_available"] = False
             st.session_state["trade_easy_strategy_waiting_reason"] = "Completed candle history is not available yet."
-            # Never clear strategy_root or strategy_detail_root here. Existing
+            # Never clear live_strategy_fragment_root_unused or live_detail_fragment_root_unused here. Existing
             # last-known content remains visible; the permanent shell already
             # contains the WAITING state when no live/completed data exists.
             return
 
         df = add_indicators(df)
+
+        # ------------------------------------------------------------
+        # LIVE DISPLAY DATA
+        # Trade decisions remain based on completed candles in `df`, but all
+        # user-facing numeric indicators are also recalculated against the
+        # current live price. This makes EMA/RSI/ATR/ADX/price metrics visibly
+        # change with the market tick, just like the Option Chain.
+        # ------------------------------------------------------------
+        live_display_df = df.copy()
+        if live_price is not None and not live_display_df.empty:
+            _lp = float(live_price)
+            _li = live_display_df.index[-1]
+            live_display_df.loc[_li, "close"] = _lp
+            live_display_df.loc[_li, "high"] = max(float(live_display_df.loc[_li, "high"]), _lp)
+            live_display_df.loc[_li, "low"] = min(float(live_display_df.loc[_li, "low"]), _lp)
+            live_display_df = add_indicators(live_display_df)
+
         levels = key_levels(df)
         pa = price_action_checks(df, levels)
         score, direction, bias, structure, reasons, invalidations = score_signal(
@@ -5202,14 +5111,14 @@ def dashboard(user, workspace):
             "structure": structure,
             "confirmation_count": int(confirmation_count),
             "entry_alert": bool(signal in ("BUY", "SELL")),
-            "ema_5": float(df["ema_5"].iloc[-1]),
-            "ema_8": float(df["ema_8"].iloc[-1]),
-            "ema_spread": float(df["ema_5_8_spread"].iloc[-1]),
+            "ema_5": float(live_display_df["ema_5"].iloc[-1]),
+            "ema_8": float(live_display_df["ema_8"].iloc[-1]),
+            "ema_spread": float(live_display_df["ema_5_8_spread"].iloc[-1]),
             "ema_state": ema_state,
             "level_setup": level_setup,
-            "rsi": float(df["rsi"].iloc[-1]) if pd.notna(df["rsi"].iloc[-1]) else None,
-            "atr": float(df["atr"].iloc[-1]) if pd.notna(df["atr"].iloc[-1]) else None,
-            "adx": adx_value,
+            "rsi": float(live_display_df["rsi"].iloc[-1]) if pd.notna(live_display_df["rsi"].iloc[-1]) else None,
+            "atr": float(live_display_df["atr"].iloc[-1]) if pd.notna(live_display_df["atr"].iloc[-1]) else None,
+            "adx": float(live_display_df["adx"].iloc[-1]) if pd.notna(live_display_df["adx"].iloc[-1]) else adx_value,
             "trigger_distance_atr": trigger_distance_atr,
             "setup_age": setup_status.get("age", 0),
             "risk_ok": bool(risk_ok),
@@ -5252,340 +5161,337 @@ def dashboard(user, workspace):
         if state_changed:
             st.session_state["trade_easy_paper_display_version"] = version
 
-        if strategy_signature == st.session_state.get("trade_easy_strategy_signature"):
-            # No new completed-candle strategy/event: keep BOTH permanent render
-            # roots untouched. Live price is handled by the tiny ticker fragment.
-            return
+        new_strategy_event = strategy_signature != st.session_state.get("trade_easy_strategy_signature")
+        if new_strategy_event:
+            st.session_state["trade_easy_strategy_signature"] = strategy_signature
+            st.session_state["trade_easy_strategy_visible"] = bool(strategy_available)
 
-        # New completed-candle/event snapshot: update the cards once. They remain
-        # visible even when the current signal is WAIT/blocked; the cards show the
-        # last evaluated data rather than disappearing.
-        st.session_state["trade_easy_strategy_signature"] = strategy_signature
-        st.session_state["trade_easy_strategy_visible"] = bool(strategy_available)
+        # IMPORTANT: render on every live poll. Strategy direction/score can remain
+        # tied to the last completed candle, while live price, EMA/RSI/ATR and
+        # distance/P&L values are refreshed continuously from the current tick.
         _render_strategy_cards(strategy_snapshot)
         state_icon = {"BUY": "🟢", "SELL": "🔴", "WAIT": "🟡", "BLOCKED": "⛔"}[signal]
 
-        # IMPORTANT: Detailed logic panels are PERMANENT.
-        # They are rendered even when a strategy is not yet confirmed.
-        # Each panel reports its own logic state (WAITING / BUILDING / READY /
-        # CONFIRMED / BLOCKED) instead of disappearing until the final signal.
-        with strategy_detail_root.container():
-            if live_price is not None:
-                st.metric("Live Price", f"{live_price:,.2f}")
-                if tick_age is not None and tick_age <= 3.0:
-                    st.caption(f"🟢 LIVE • WebSocket • {tick_age:.1f}s old • {int(live_state.get('tick_count', 0))} ticks")
-                else:
-                    st.caption("🟡 Waiting for a fresh live tick")
+    # IMPORTANT: Detailed logic panels are PERMANENT.
+    # They are rendered even when a strategy is not yet confirmed.
+    # Each panel reports its own logic state (WAITING / BUILDING / READY /
+    # CONFIRMED / BLOCKED) instead of disappearing until the final signal.
+        if live_price is not None:
+            st.metric("Live Price", f"{live_price:,.2f}")
+            if tick_age is not None and tick_age <= 3.0:
+                st.caption(f"🟢 LIVE • WebSocket • {tick_age:.1f}s old • {int(live_state.get('tick_count', 0))} ticks")
+            else:
+                st.caption("🟡 Waiting for a fresh live tick")
     
-            state_message = {
-                "BUY": "LONG direction confirmed — entry conditions passed.",
-                "SELL": "SHORT direction confirmed — entry conditions passed.",
-                "WAIT": f"{direction or 'NO'} direction detected — entry confirmation is still pending.",
-                "BLOCKED": "A mandatory data, risk, or safety condition has blocked the trade candidate.",
-            }[signal]
+        state_message = {
+            "BUY": "LONG direction confirmed — entry conditions passed.",
+            "SELL": "SHORT direction confirmed — entry conditions passed.",
+            "WAIT": f"{direction or 'NO'} direction detected — entry confirmation is still pending.",
+            "BLOCKED": "A mandatory data, risk, or safety condition has blocked the trade candidate.",
+        }[signal]
+        st.markdown(
+            f'<div class="state-box">'
+            f'<div class="muted">FINAL CONFIRMATION STATE</div>'
+            f'<div class="state-title">{state_icon} {signal}</div>'
+            f'<div class="state-sub">{state_message}</div>'
+            f'<div class="state-sub" style="margin-top:8px;">Score: {score}/100 &nbsp; • &nbsp; HTF Bias: {bias} &nbsp; • &nbsp; Structure: {structure}</div>'
+            f'</div>',
+            unsafe_allow_html=True,
+        )
+    
+        if signal == "BLOCKED":
+            st.error("Trade blocked because a mandatory data/risk/order condition failed.")
+        elif signal == "WAIT":
+            if level_setup.get("status") == "NO TRADE":
+                st.warning(f"WAIT: {direction or 'NO'} setup does not have the required clear path. No chase entry.")
+            elif direction and score < 75:
+                st.warning(f"WAIT: {direction} direction detected, but entry score is {score}/75. More confirmation is required.")
+            elif direction and confirmation_count < 2:
+                st.warning(f"WAIT: {direction} direction detected. Price-action confirmation is still pending ({confirmation_count}/2).")
+            else:
+                st.warning("WAIT: confirmation is below the trade-candidate threshold or requires further confirmation.")
+        elif signal in ("BUY", "SELL"):
+            st.success(f"{signal} candidate: score ≥ 75 and mandatory risk checks passed.")
+    
+        st.markdown('<div class="section-head">Entry Confirmation</div>', unsafe_allow_html=True)
+        st.caption("🟢 LOGIC COMPLETE" if signal in ("BUY", "SELL") and risk_ok and ema_state.get("confirmed") and level_setup.get("status") == "CONFIRMED" else "🟡 LOGIC PENDING — conditions will appear here as they are satisfied.")
+        ec1, ec2, ec3, ec4 = st.columns(4)
+        ec1.metric("Entry Score", f"{score}/75")
+        ec2.metric("PA Confirmations", f"{confirmation_count}/2")
+        ec3.metric("5/8 EMA", "PASS" if ema_state.get("confirmed") else "WAIT")
+        ec4.metric("Entry Alert", "YES" if signal in ("BUY", "SELL") else "NO")
+
+        st.markdown('<div class="section-head">5/8 EMA Momentum Filter</div>', unsafe_allow_html=True)
+        st.caption("🟢 LOGIC COMPLETE — EMA 5/8 confirmation passed." if ema_state.get("confirmed") else "🟡 LOGIC PENDING — waiting for direction + EMA 5/8 confirmation.")
+        em1, em2, em3, em4, em5 = st.columns(5)
+        em1.metric("EMA 5", f"{float(df['ema_5'].iloc[-1]):,.2f}")
+        em2.metric("EMA 8", f"{float(df['ema_8'].iloc[-1]):,.2f}")
+        em3.metric("Spread", f"{float(df['ema_5_8_spread'].iloc[-1]):+,.2f}")
+        em4.metric("Trend", ema_state.get("trend", "—"))
+        em5.metric("Cross", ema_state.get("cross", "NONE"))
+        if ema_state.get("confirmed"):
+            st.success("🟢 5/8 EMA confirms the current direction.")
+        elif direction:
+            st.warning(f"🟡 5/8 EMA pending for {direction}: {ema_state.get('reason', 'PENDING')}")
+        else:
+            st.caption("5/8 EMA waiting for a valid LONG/SHORT direction.")
+        st.caption(f"EMA5 slope: {float(df['ema_5_slope'].iloc[-1]):+,.3f} • Price: {ema_state.get('price_position', '—')}")
+        pending_all = list(pending_confirmations)
+        if direction and not ema_state.get("confirmed", False):
+            pending_all.append("EMA_5_8")
+        if pending_all and signal == "WAIT":
             st.markdown(
-                f'<div class="state-box">'
-                f'<div class="muted">FINAL CONFIRMATION STATE</div>'
-                f'<div class="state-title">{state_icon} {signal}</div>'
-                f'<div class="state-sub">{state_message}</div>'
-                f'<div class="state-sub" style="margin-top:8px;">Score: {score}/100 &nbsp; • &nbsp; HTF Bias: {bias} &nbsp; • &nbsp; Structure: {structure}</div>'
-                f'</div>',
+                '<div class="pending-box">Pending confirmations: ' +
+                ' &nbsp; • &nbsp; '.join(pending_confirmations) +
+                '</div>',
                 unsafe_allow_html=True,
             )
     
-            if signal == "BLOCKED":
-                st.error("Trade blocked because a mandatory data/risk/order condition failed.")
-            elif signal == "WAIT":
-                if level_setup.get("status") == "NO TRADE":
-                    st.warning(f"WAIT: {direction or 'NO'} setup does not have the required clear path. No chase entry.")
-                elif direction and score < 75:
-                    st.warning(f"WAIT: {direction} direction detected, but entry score is {score}/75. More confirmation is required.")
-                elif direction and confirmation_count < 2:
-                    st.warning(f"WAIT: {direction} direction detected. Price-action confirmation is still pending ({confirmation_count}/2).")
-                else:
-                    st.warning("WAIT: confirmation is below the trade-candidate threshold or requires further confirmation.")
-            elif signal in ("BUY", "SELL"):
-                st.success(f"{signal} candidate: score ≥ 75 and mandatory risk checks passed.")
-    
-            st.markdown('<div class="section-head">Entry Confirmation</div>', unsafe_allow_html=True)
-            st.caption("🟢 LOGIC COMPLETE" if signal in ("BUY", "SELL") and risk_ok and ema_state.get("confirmed") and level_setup.get("status") == "CONFIRMED" else "🟡 LOGIC PENDING — conditions will appear here as they are satisfied.")
-            ec1, ec2, ec3, ec4 = st.columns(4)
-            ec1.metric("Entry Score", f"{score}/75")
-            ec2.metric("PA Confirmations", f"{confirmation_count}/2")
-            ec3.metric("5/8 EMA", "PASS" if ema_state.get("confirmed") else "WAIT")
-            ec4.metric("Entry Alert", "YES" if signal in ("BUY", "SELL") else "NO")
+        st.markdown('<div class="section-head">Swing / Level Engine</div>', unsafe_allow_html=True)
+        st.caption("🟢 LOGIC COMPLETE — level setup confirmed." if level_setup.get("status") == "CONFIRMED" else ("🔴 LOGIC BLOCKED — no qualifying path/setup." if level_setup.get("status") == "NO TRADE" else "🟡 LOGIC BUILDING — waiting for level/path confirmations."))
+        lc1, lc2, lc3, lc4, lc5 = st.columns(5)
+        lc1.metric("Trend", bias or "—")
+        lc2.metric("Setup", level_setup.get("status", "—"))
+        lc3.metric("Type", level_setup.get("trade_type", "—"))
+        clear_pts = level_setup.get("path", {}).get("clear_path")
+        meaningful_pts = level_setup.get("path", {}).get("meaningful_move")
+        lc4.metric("Clear Path", f"{clear_pts:.1f} pts" if clear_pts is not None and np.isfinite(clear_pts) else "—")
+        raw_pts = level_setup.get("path", {}).get("raw_distance")
+        lc5.metric("Raw Distance", f"{raw_pts:.1f} pts" if raw_pts is not None and np.isfinite(raw_pts) else "—")
+        obstacle = level_setup.get("path", {}).get("obstacle_name", "NONE")
+        obstacle_price = level_setup.get("path", {}).get("first_obstacle")
+        obstacle_text = f"{obstacle} @ {obstacle_price:.2f}" if obstacle_price is not None and np.isfinite(obstacle_price) else obstacle
+        clear_path_text = f"{float(clear_pts):.1f}" if clear_pts is not None and np.isfinite(clear_pts) else "—"
+        meaningful_text = f"{float(meaningful_pts):.1f}" if meaningful_pts is not None and np.isfinite(meaningful_pts) else "—"
+        if level_setup.get("status") == "CONFIRMED":
+            st.success(f"🟢 ENTRY CONFIRMED • {direction or 'NO DIRECTION'} • {level_setup.get('trade_type')} • Clear Path {clear_path_text} pts • Required {meaningful_text} pts • First obstacle: {obstacle_text}")
+        elif level_setup.get("status") == "NO TRADE":
+            st.error(f"🔴 NO TRADE • {level_setup.get('reason')} • Clear Path {clear_path_text} pts • Required {meaningful_text} pts • First obstacle: {obstacle_text}")
+        else:
+            st.warning(f"🟡 {level_setup.get('status')} • {direction or 'NO DIRECTION'} • {level_setup.get('trade_type')} • Clear Path {clear_path_text} pts • Required {meaningful_text} pts • {level_setup.get('reason')}")
+        if option_summary.get("available"):
+            oc1, oc2, oc3, oc4, oc5 = st.columns(5)
+            oc1.metric("CALL OI", f"{option_summary['call_oi']:,.0f}")
+            oc2.metric("PUT OI", f"{option_summary['put_oi']:,.0f}")
+            oc3.metric("CALL OI Chg", f"{option_summary['call_oi_change']:,.0f}")
+            oc4.metric("PUT OI Chg", f"{option_summary['put_oi_change']:,.0f}")
+            oc5.metric("PCR", f"{option_summary['pcr']:.2f}" if np.isfinite(option_summary['pcr']) else "—")
+        else:
+            st.caption(f"OI/OI Change: {option_chain_error or 'Option-chain data not available'} — no invented OI values.")
+        st.markdown('<div class="section-head">Paper Entry / Exit Map</div>', unsafe_allow_html=True)
+        if plan:
+            pc1, pc2, pc3, pc4, pc5 = st.columns(5)
+            pc1.metric("Entry Price", f"₹{plan['entry']:,.2f}")
+            pc2.metric("Live Price", f"₹{live_price:,.2f}" if live_price is not None else "—")
+            pc3.metric("Stop Loss", f"₹{plan['stop_loss']:,.2f}")
+            pc4.metric("Target", f"₹{plan['target']:,.2f}")
+            pc5.metric("Quantity", PAPER_FIXED_QUANTITY)
+            st.success("🟢 ENTRY/EXIT LOGIC READY — trade plan calculated from the current validated setup.")
+        else:
+            pc1, pc2, pc3, pc4, pc5 = st.columns(5)
+            pc1.metric("Entry Price", "—")
+            pc2.metric("Live Price", f"₹{live_price:,.2f}" if live_price is not None else "—")
+            pc3.metric("Stop Loss", "—")
+            pc4.metric("Target", "—")
+            pc5.metric("Quantity", PAPER_FIXED_QUANTITY)
+            st.warning("🟡 ENTRY/EXIT LOGIC PENDING — a valid direction/setup is required before prices are calculated.")
 
-            st.markdown('<div class="section-head">5/8 EMA Momentum Filter</div>', unsafe_allow_html=True)
-            st.caption("🟢 LOGIC COMPLETE — EMA 5/8 confirmation passed." if ema_state.get("confirmed") else "🟡 LOGIC PENDING — waiting for direction + EMA 5/8 confirmation.")
-            em1, em2, em3, em4, em5 = st.columns(5)
-            em1.metric("EMA 5", f"{float(df['ema_5'].iloc[-1]):,.2f}")
-            em2.metric("EMA 8", f"{float(df['ema_8'].iloc[-1]):,.2f}")
-            em3.metric("Spread", f"{float(df['ema_5_8_spread'].iloc[-1]):+,.2f}")
-            em4.metric("Trend", ema_state.get("trend", "—"))
-            em5.metric("Cross", ema_state.get("cross", "NONE"))
-            if ema_state.get("confirmed"):
-                st.success("🟢 5/8 EMA confirms the current direction.")
-            elif direction:
-                st.warning(f"🟡 5/8 EMA pending for {direction}: {ema_state.get('reason', 'PENDING')}")
-            else:
-                st.caption("5/8 EMA waiting for a valid LONG/SHORT direction.")
-            st.caption(f"EMA5 slope: {float(df['ema_5_slope'].iloc[-1]):+,.3f} • Price: {ema_state.get('price_position', '—')}")
-            pending_all = list(pending_confirmations)
-            if direction and not ema_state.get("confirmed", False):
-                pending_all.append("EMA_5_8")
-            if pending_all and signal == "WAIT":
-                st.markdown(
-                    '<div class="pending-box">Pending confirmations: ' +
-                    ' &nbsp; • &nbsp; '.join(pending_confirmations) +
-                    '</div>',
-                    unsafe_allow_html=True,
-                )
+        st.markdown('<div class="section-head">Market Snapshot</div>', unsafe_allow_html=True)
+        m1, m2, m3, m4, m5, m6 = st.columns(6)
+        m1.metric("Score", score)
+        m2.metric("HTF Bias", bias)
+        m3.metric("Structure", structure)
+        m4.metric("RSI", f"{df['rsi'].iloc[-1]:.1f}" if pd.notna(df["rsi"].iloc[-1]) else "—")
+        m5.metric("ATR", f"{df['atr'].iloc[-1]:.2f}" if pd.notna(df["atr"].iloc[-1]) else "—")
+        m6.metric("5/8 EMA", ema_state.get("trend", "—"))
+        st.markdown('<div class="section-head">Phase-1 Risk Controls</div>', unsafe_allow_html=True)
+        st.caption("🟢 LOGIC COMPLETE — mandatory risk/session checks passed." if risk_ok and not phase1_failures else "🔴 LOGIC BLOCKED — one or more mandatory risk/session checks failed or are pending.")
+        rc1, rc2, rc3, rc4, rc5 = st.columns(5)
+        rc1.metric("ADX", f"{adx_value:.1f}" if adx_value is not None else "—", "PASS" if adx_value is not None and adx_value >= float(adx_min) else "WEAK")
+        rc2.metric("Session", "OPEN" if not session_status["failures"] else "BLOCKED")
+        rc3.metric("Entry Distance", f"{trigger_distance_atr:.2f} ATR" if trigger_distance_atr is not None else "—")
+        rc4.metric("Setup Age", f"{setup_status.get('age', 0)}/{setup_expiry_candles}")
+        rc5.metric("Paper Risk", "PASS" if paper_risk_ok else "BLOCKED")
+        if phase1_failures:
+            st.markdown('<div class="pending-box">Phase-1 blocks: ' + ' &nbsp; • &nbsp; '.join(phase1_failures) + '</div>', unsafe_allow_html=True)
     
-            st.markdown('<div class="section-head">Swing / Level Engine</div>', unsafe_allow_html=True)
-            st.caption("🟢 LOGIC COMPLETE — level setup confirmed." if level_setup.get("status") == "CONFIRMED" else ("🔴 LOGIC BLOCKED — no qualifying path/setup." if level_setup.get("status") == "NO TRADE" else "🟡 LOGIC BUILDING — waiting for level/path confirmations."))
-            lc1, lc2, lc3, lc4, lc5 = st.columns(5)
-            lc1.metric("Trend", bias or "—")
-            lc2.metric("Setup", level_setup.get("status", "—"))
-            lc3.metric("Type", level_setup.get("trade_type", "—"))
-            clear_pts = level_setup.get("path", {}).get("clear_path")
-            meaningful_pts = level_setup.get("path", {}).get("meaningful_move")
-            lc4.metric("Clear Path", f"{clear_pts:.1f} pts" if clear_pts is not None and np.isfinite(clear_pts) else "—")
-            raw_pts = level_setup.get("path", {}).get("raw_distance")
-            lc5.metric("Raw Distance", f"{raw_pts:.1f} pts" if raw_pts is not None and np.isfinite(raw_pts) else "—")
-            obstacle = level_setup.get("path", {}).get("obstacle_name", "NONE")
-            obstacle_price = level_setup.get("path", {}).get("first_obstacle")
-            obstacle_text = f"{obstacle} @ {obstacle_price:.2f}" if obstacle_price is not None and np.isfinite(obstacle_price) else obstacle
-            clear_path_text = f"{float(clear_pts):.1f}" if clear_pts is not None and np.isfinite(clear_pts) else "—"
-            meaningful_text = f"{float(meaningful_pts):.1f}" if meaningful_pts is not None and np.isfinite(meaningful_pts) else "—"
-            if level_setup.get("status") == "CONFIRMED":
-                st.success(f"🟢 ENTRY CONFIRMED • {direction or 'NO DIRECTION'} • {level_setup.get('trade_type')} • Clear Path {clear_path_text} pts • Required {meaningful_text} pts • First obstacle: {obstacle_text}")
-            elif level_setup.get("status") == "NO TRADE":
-                st.error(f"🔴 NO TRADE • {level_setup.get('reason')} • Clear Path {clear_path_text} pts • Required {meaningful_text} pts • First obstacle: {obstacle_text}")
-            else:
-                st.warning(f"🟡 {level_setup.get('status')} • {direction or 'NO DIRECTION'} • {level_setup.get('trade_type')} • Clear Path {clear_path_text} pts • Required {meaningful_text} pts • {level_setup.get('reason')}")
-            if option_summary.get("available"):
-                oc1, oc2, oc3, oc4, oc5 = st.columns(5)
-                oc1.metric("CALL OI", f"{option_summary['call_oi']:,.0f}")
-                oc2.metric("PUT OI", f"{option_summary['put_oi']:,.0f}")
-                oc3.metric("CALL OI Chg", f"{option_summary['call_oi_change']:,.0f}")
-                oc4.metric("PUT OI Chg", f"{option_summary['put_oi_change']:,.0f}")
-                oc5.metric("PCR", f"{option_summary['pcr']:.2f}" if np.isfinite(option_summary['pcr']) else "—")
-            else:
-                st.caption(f"OI/OI Change: {option_chain_error or 'Option-chain data not available'} — no invented OI values.")
-            st.markdown('<div class="section-head">Paper Entry / Exit Map</div>', unsafe_allow_html=True)
-            if plan:
-                pc1, pc2, pc3, pc4, pc5 = st.columns(5)
-                pc1.metric("Entry Price", f"₹{plan['entry']:,.2f}")
-                pc2.metric("Live Price", f"₹{live_price:,.2f}" if live_price is not None else "—")
-                pc3.metric("Stop Loss", f"₹{plan['stop_loss']:,.2f}")
-                pc4.metric("Target", f"₹{plan['target']:,.2f}")
-                pc5.metric("Quantity", PAPER_FIXED_QUANTITY)
-                st.success("🟢 ENTRY/EXIT LOGIC READY — trade plan calculated from the current validated setup.")
-            else:
-                pc1, pc2, pc3, pc4, pc5 = st.columns(5)
-                pc1.metric("Entry Price", "—")
-                pc2.metric("Live Price", f"₹{live_price:,.2f}" if live_price is not None else "—")
-                pc3.metric("Stop Loss", "—")
-                pc4.metric("Target", "—")
-                pc5.metric("Quantity", PAPER_FIXED_QUANTITY)
-                st.warning("🟡 ENTRY/EXIT LOGIC PENDING — a valid direction/setup is required before prices are calculated.")
+        st.markdown('<div class="section-head">Phase-2 Paper Execution</div>', unsafe_allow_html=True)
+        st.caption("🟢 LOGIC ACTIVE — paper execution engine is ready to act only after the final entry alert." if not paper_state.get("paper_kill_switch") else "🔴 LOGIC BLOCKED — paper kill switch is active.")
+        pe1, pe2, pe3, pe4 = st.columns(4)
+        pe1.metric("Paper Position", "OPEN" if paper_state.get("open_position") else "FLAT")
+        pe2.metric("Trades Today", f"{trades_today}/{int(max_trades)}")
+        pe3.metric("Realized P&L", f"₹{daily_pnl:,.2f}")
+        pe4.metric("Unrealized P&L", f"₹{paper_unrealized:,.2f}")
 
-            st.markdown('<div class="section-head">Market Snapshot</div>', unsafe_allow_html=True)
-            m1, m2, m3, m4, m5, m6 = st.columns(6)
-            m1.metric("Score", score)
-            m2.metric("HTF Bias", bias)
-            m3.metric("Structure", structure)
-            m4.metric("RSI", f"{df['rsi'].iloc[-1]:.1f}" if pd.notna(df["rsi"].iloc[-1]) else "—")
-            m5.metric("ATR", f"{df['atr'].iloc[-1]:.2f}" if pd.notna(df["atr"].iloc[-1]) else "—")
-            m6.metric("5/8 EMA", ema_state.get("trend", "—"))
-            st.markdown('<div class="section-head">Phase-1 Risk Controls</div>', unsafe_allow_html=True)
-            st.caption("🟢 LOGIC COMPLETE — mandatory risk/session checks passed." if risk_ok and not phase1_failures else "🔴 LOGIC BLOCKED — one or more mandatory risk/session checks failed or are pending.")
-            rc1, rc2, rc3, rc4, rc5 = st.columns(5)
-            rc1.metric("ADX", f"{adx_value:.1f}" if adx_value is not None else "—", "PASS" if adx_value is not None and adx_value >= float(adx_min) else "WEAK")
-            rc2.metric("Session", "OPEN" if not session_status["failures"] else "BLOCKED")
-            rc3.metric("Entry Distance", f"{trigger_distance_atr:.2f} ATR" if trigger_distance_atr is not None else "—")
-            rc4.metric("Setup Age", f"{setup_status.get('age', 0)}/{setup_expiry_candles}")
-            rc5.metric("Paper Risk", "PASS" if paper_risk_ok else "BLOCKED")
-            if phase1_failures:
-                st.markdown('<div class="pending-box">Phase-1 blocks: ' + ' &nbsp; • &nbsp; '.join(phase1_failures) + '</div>', unsafe_allow_html=True)
+        if paper_state.get("open_position"):
+            pp = paper_state["open_position"]
+            pcols = st.columns(6)
+            pcols[0].metric("Direction", pp.get("direction", "—"))
+            pcols[1].metric("Entry", f"₹{float(pp.get('entry_price', 0)):,.2f}")
+            pcols[2].metric("Current", f"₹{float(live_price):,.2f}" if live_price is not None else "—")
+            pcols[3].metric("Stop Loss", f"₹{float(pp.get('stop_loss', 0)):,.2f}")
+            pcols[4].metric("Target", f"₹{float(pp.get('target', 0)):,.2f}")
+            pcols[5].metric("Qty", int(pp.get("quantity", 0)))
+            if st.button("⏹️ Manual Paper Exit", type="secondary", use_container_width=True):
+                exit_price = float(live_price) if live_price is not None else float(pp.get("entry_price", 0))
+                closed = paper_close_position(paper_state, exit_price, "MANUAL_EXIT")
+                save_paper_state(paper_user_id, paper_workspace_id, paper_state)
+                if closed:
+                    st.success(f"Paper position closed @ ₹{exit_price:,.2f} | P&L ₹{closed['realized_pnl']:,.2f}")
+                st.rerun()
     
-            st.markdown('<div class="section-head">Phase-2 Paper Execution</div>', unsafe_allow_html=True)
-            st.caption("🟢 LOGIC ACTIVE — paper execution engine is ready to act only after the final entry alert." if not paper_state.get("paper_kill_switch") else "🔴 LOGIC BLOCKED — paper kill switch is active.")
-            pe1, pe2, pe3, pe4 = st.columns(4)
-            pe1.metric("Paper Position", "OPEN" if paper_state.get("open_position") else "FLAT")
-            pe2.metric("Trades Today", f"{trades_today}/{int(max_trades)}")
-            pe3.metric("Realized P&L", f"₹{daily_pnl:,.2f}")
-            pe4.metric("Unrealized P&L", f"₹{paper_unrealized:,.2f}")
-
-            if paper_state.get("open_position"):
-                pp = paper_state["open_position"]
-                pcols = st.columns(6)
-                pcols[0].metric("Direction", pp.get("direction", "—"))
-                pcols[1].metric("Entry", f"₹{float(pp.get('entry_price', 0)):,.2f}")
-                pcols[2].metric("Current", f"₹{float(live_price):,.2f}" if live_price is not None else "—")
-                pcols[3].metric("Stop Loss", f"₹{float(pp.get('stop_loss', 0)):,.2f}")
-                pcols[4].metric("Target", f"₹{float(pp.get('target', 0)):,.2f}")
-                pcols[5].metric("Qty", int(pp.get("quantity", 0)))
-                if st.button("⏹️ Manual Paper Exit", type="secondary", use_container_width=True):
-                    exit_price = float(live_price) if live_price is not None else float(pp.get("entry_price", 0))
-                    closed = paper_close_position(paper_state, exit_price, "MANUAL_EXIT")
+        history = paper_state.get("trade_history") or []
+        if history:
+            st.markdown("**Recent Paper Trades**")
+            hist_rows = []
+            for t in reversed(history[-10:]):
+                hist_rows.append({
+                    "Time": t.get("exit_time", t.get("entry_time", "")),
+                    "Direction": t.get("direction", ""),
+                    "Entry": round(float(t.get("entry_price", 0)), 2),
+                    "Exit": round(float(t.get("exit_price", 0)), 2),
+                    "Qty": int(t.get("quantity", 0)),
+                    "P&L": round(float(t.get("realized_pnl", 0)), 2),
+                    "Exit Reason": t.get("exit_reason", ""),
+                })
+            st.dataframe(pd.DataFrame(hist_rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption("अभी कोई completed paper trade नहीं है।")
+    
+        st.markdown('<div class="section-head">Phase-3 Monitoring & Audit</div>', unsafe_allow_html=True)
+        m1, m2, m3, m4 = st.columns(4)
+        m1.metric("Paper Engine", "KILLED" if paper_state.get("paper_kill_switch") else "RUNNING")
+        m2.metric("Live Price", f"₹{float(live_price):,.2f}" if live_price is not None else "—")
+        m3.metric("Audit Events", len(paper_state.get("audit_log") or []))
+        m4.metric("Paper P&L", f"₹{float(paper_state.get('daily_realized_pnl', 0.0)) + float(paper_unrealized):,.2f}")
+        if live_price is not None:
+            source_label = "WebSocket" if ws_price is not None else "Quotes fallback"
+            freshness = f"tick age {tick_age:.1f}s" if tick_age is not None else "snapshot"
+            st.caption(f"🟢 Live price source: {source_label} • {freshness} • {symbol}")
+        else:
+            st.info("Live price अभी उपलब्ध नहीं है; last available value बनी रहेगी।")
+        kc1, kc2 = st.columns([1, 3])
+        with kc1:
+            if paper_state.get("paper_kill_switch"):
+                if st.button("▶️ Resume Paper Engine", use_container_width=True):
+                    paper_state["paper_kill_switch"] = False
+                    paper_audit_event(paper_state, "PAPER_KILL_SWITCH_OFF")
                     save_paper_state(paper_user_id, paper_workspace_id, paper_state)
-                    if closed:
-                        st.success(f"Paper position closed @ ₹{exit_price:,.2f} | P&L ₹{closed['realized_pnl']:,.2f}")
                     st.rerun()
-    
-            history = paper_state.get("trade_history") or []
-            if history:
-                st.markdown("**Recent Paper Trades**")
-                hist_rows = []
-                for t in reversed(history[-10:]):
-                    hist_rows.append({
-                        "Time": t.get("exit_time", t.get("entry_time", "")),
-                        "Direction": t.get("direction", ""),
-                        "Entry": round(float(t.get("entry_price", 0)), 2),
-                        "Exit": round(float(t.get("exit_price", 0)), 2),
-                        "Qty": int(t.get("quantity", 0)),
-                        "P&L": round(float(t.get("realized_pnl", 0)), 2),
-                        "Exit Reason": t.get("exit_reason", ""),
-                    })
-                st.dataframe(pd.DataFrame(hist_rows), use_container_width=True, hide_index=True)
             else:
-                st.caption("अभी कोई completed paper trade नहीं है।")
+                if st.button("🛑 Paper Kill Switch", type="secondary", use_container_width=True):
+                    paper_state["paper_kill_switch"] = True
+                    paper_audit_event(paper_state, "PAPER_KILL_SWITCH_ON")
+                    save_paper_state(paper_user_id, paper_workspace_id, paper_state)
+                    st.rerun()
+        with kc2:
+            st.caption("यह Phase-3 kill switch केवल PAPER position/engine को रोकता है; live market connection प्रभावित नहीं होता।")
+        audit_rows = []
+        for ev in reversed((paper_state.get("audit_log") or [])[-15:]):
+            audit_rows.append({"Time": ev.get("timestamp", ""), "Event": ev.get("event_type", ""), "Reason": ev.get("reason", ""), "Trade ID": (ev.get("trade") or {}).get("id", "")})
+        if audit_rows:
+            st.dataframe(pd.DataFrame(audit_rows), use_container_width=True, hide_index=True)
     
-            st.markdown('<div class="section-head">Phase-3 Monitoring & Audit</div>', unsafe_allow_html=True)
-            m1, m2, m3, m4 = st.columns(4)
-            m1.metric("Paper Engine", "KILLED" if paper_state.get("paper_kill_switch") else "RUNNING")
-            m2.metric("Live Price", f"₹{float(live_price):,.2f}" if live_price is not None else "—")
-            m3.metric("Audit Events", len(paper_state.get("audit_log") or []))
-            m4.metric("Paper P&L", f"₹{float(paper_state.get('daily_realized_pnl', 0.0)) + float(paper_unrealized):,.2f}")
-            if live_price is not None:
-                source_label = "WebSocket" if ws_price is not None else "Quotes fallback"
-                freshness = f"tick age {tick_age:.1f}s" if tick_age is not None else "snapshot"
-                st.caption(f"🟢 Live price source: {source_label} • {freshness} • {symbol}")
+        st.markdown('<div class="section-head">Signal Output</div>', unsafe_allow_html=True)
+        signal_json = {
+            **payload,
+            "quantity": plan["quantity"] if plan else 0,
+        }
+        sc1, sc2, sc3, sc4 = st.columns(4)
+        sc1.metric("Direction", direction or "—")
+        sc2.metric("Signal", signal)
+        sc3.metric("Risk / Reward", f"{plan['risk_reward']:.2f}" if plan else "—")
+        sc4.metric("Quantity", plan["quantity"] if plan else 0)
+        st.markdown('<div class="json-note">Raw JSON is kept available for download/audit without dominating the dashboard.</div>', unsafe_allow_html=True)
+        with st.expander("View raw Signal Output JSON", expanded=False):
+            st.json(signal_json)
+    
+        if plan:
+            p1, p2, p3, p4, p5 = st.columns(5)
+            p1.metric("Entry", f"{plan['entry']:.2f}")
+            p2.metric("Stop Loss", f"{plan['stop_loss']:.2f}")
+            p3.metric("Target", f"{plan['target']:.2f}")
+            p4.metric("Risk/Reward", f"{plan['risk_reward']:.2f}")
+            p5.metric("Quantity", plan["quantity"])
+    
+        st.markdown('<div class="section-head">Mandatory Checks</div>', unsafe_allow_html=True)
+        checks = {
+            "Data validation": data_ok,
+            "Completed candle": "INCOMPLETE_CANDLE" not in data_reasons,
+            "Duplicate check": "DUPLICATE_CANDLE" not in data_reasons,
+            "Stale-data check": "STALE_DATA" not in data_reasons,
+            "News filter": not news_block,
+            "Risk checks": risk_ok,
+            "Minimum RR": bool(plan and plan["risk_reward"] >= min_rr),
+            "Session / expiry": not bool(session_status["failures"]),
+            "ADX support": bool(adx_value is not None and adx_value >= float(adx_min)),
+            "5/8 EMA confirmation": bool(ema_state.get("confirmed", False)),
+            "Entry distance": bool(trigger_distance_atr is None or trigger_distance_atr <= float(max_trigger_atr)),
+            "Setup not expired": not setup_status.get("expired", False),
+            "Duplicate protection": not duplicate_entry,
+            "Daily loss limit": "DAILY_LOSS_LIMIT" not in paper_risk_failures,
+            "Max trades": "MAX_TRADES_REACHED" not in paper_risk_failures,
+            "Open positions": "OPEN_POSITION_LIMIT" not in paper_risk_failures,
+        }
+        check_df = pd.DataFrame(
+            [{"Check": k, "Status": "PASS" if v else "FAIL"} for k, v in checks.items()]
+        )
+        st.dataframe(check_df, use_container_width=True, hide_index=True)
+    
+        st.markdown('<div class="section-head">Key Levels</div>', unsafe_allow_html=True)
+        level_df = pd.DataFrame(
+            [{"Level": k.replace("_", " ").title(), "Value": v} for k, v in levels.items()]
+        )
+        st.dataframe(level_df, use_container_width=True, hide_index=True)
+    
+        st.markdown('<div class="section-head">Reasons / Invalidations</div>', unsafe_allow_html=True)
+        r1, r2 = st.columns(2)
+        with r1:
+            st.markdown("**Reason codes**")
+            if reasons:
+                for x in reasons:
+                    st.markdown(f'<div class="reason-item">✅ {x}</div>', unsafe_allow_html=True)
             else:
-                st.info("Live price अभी उपलब्ध नहीं है; last available value बनी रहेगी।")
-            kc1, kc2 = st.columns([1, 3])
-            with kc1:
-                if paper_state.get("paper_kill_switch"):
-                    if st.button("▶️ Resume Paper Engine", use_container_width=True):
-                        paper_state["paper_kill_switch"] = False
-                        paper_audit_event(paper_state, "PAPER_KILL_SWITCH_OFF")
-                        save_paper_state(paper_user_id, paper_workspace_id, paper_state)
-                        st.rerun()
-                else:
-                    if st.button("🛑 Paper Kill Switch", type="secondary", use_container_width=True):
-                        paper_state["paper_kill_switch"] = True
-                        paper_audit_event(paper_state, "PAPER_KILL_SWITCH_ON")
-                        save_paper_state(paper_user_id, paper_workspace_id, paper_state)
-                        st.rerun()
-            with kc2:
-                st.caption("यह Phase-3 kill switch केवल PAPER position/engine को रोकता है; live market connection प्रभावित नहीं होता।")
-            audit_rows = []
-            for ev in reversed((paper_state.get("audit_log") or [])[-15:]):
-                audit_rows.append({"Time": ev.get("timestamp", ""), "Event": ev.get("event_type", ""), "Reason": ev.get("reason", ""), "Trade ID": (ev.get("trade") or {}).get("id", "")})
-            if audit_rows:
-                st.dataframe(pd.DataFrame(audit_rows), use_container_width=True, hide_index=True)
+                st.markdown('<div class="reason-item">No positive reason code.</div>', unsafe_allow_html=True)
+        with r2:
+            st.markdown("**Invalidations / blocks**")
+            if invalidations:
+                for x in invalidations:
+                    st.markdown(f'<div class="reason-item">⛔ {x}</div>', unsafe_allow_html=True)
+            else:
+                st.markdown('<div class="reason-item status-pass">✓ None</div>', unsafe_allow_html=True)
     
-            st.markdown('<div class="section-head">Signal Output</div>', unsafe_allow_html=True)
-            signal_json = {
-                **payload,
-                "quantity": plan["quantity"] if plan else 0,
-            }
-            sc1, sc2, sc3, sc4 = st.columns(4)
-            sc1.metric("Direction", direction or "—")
-            sc2.metric("Signal", signal)
-            sc3.metric("Risk / Reward", f"{plan['risk_reward']:.2f}" if plan else "—")
-            sc4.metric("Quantity", plan["quantity"] if plan else 0)
-            st.markdown('<div class="json-note">Raw JSON is kept available for download/audit without dominating the dashboard.</div>', unsafe_allow_html=True)
-            with st.expander("View raw Signal Output JSON", expanded=False):
-                st.json(signal_json)
+        st.markdown('<div class="section-head">Validated Candle Data</div>', unsafe_allow_html=True)
+        st.dataframe(
+            df.tail(50)[
+                ["timestamp", "open", "high", "low", "close", "volume", "vwap",
+                 "ma_fast", "ma_slow", "ema_5", "ema_8", "ema_5_8_spread",
+                 "rsi", "macd", "macd_signal", "atr", "adx"]
+            ],
+            use_container_width=True,
+            hide_index=True,
+            height=420,
+        )
     
-            if plan:
-                p1, p2, p3, p4, p5 = st.columns(5)
-                p1.metric("Entry", f"{plan['entry']:.2f}")
-                p2.metric("Stop Loss", f"{plan['stop_loss']:.2f}")
-                p3.metric("Target", f"{plan['target']:.2f}")
-                p4.metric("Risk/Reward", f"{plan['risk_reward']:.2f}")
-                p5.metric("Quantity", plan["quantity"])
+        st.download_button(
+            "Download Signal JSON",
+            data=json.dumps(signal_json, indent=2, default=str),
+            file_name="trade_easy_signal.json",
+            mime="application/json",
+            use_container_width=True,
+        )
     
-            st.markdown('<div class="section-head">Mandatory Checks</div>', unsafe_allow_html=True)
-            checks = {
-                "Data validation": data_ok,
-                "Completed candle": "INCOMPLETE_CANDLE" not in data_reasons,
-                "Duplicate check": "DUPLICATE_CANDLE" not in data_reasons,
-                "Stale-data check": "STALE_DATA" not in data_reasons,
-                "News filter": not news_block,
-                "Risk checks": risk_ok,
-                "Minimum RR": bool(plan and plan["risk_reward"] >= min_rr),
-                "Session / expiry": not bool(session_status["failures"]),
-                "ADX support": bool(adx_value is not None and adx_value >= float(adx_min)),
-                "5/8 EMA confirmation": bool(ema_state.get("confirmed", False)),
-                "Entry distance": bool(trigger_distance_atr is None or trigger_distance_atr <= float(max_trigger_atr)),
-                "Setup not expired": not setup_status.get("expired", False),
-                "Duplicate protection": not duplicate_entry,
-                "Daily loss limit": "DAILY_LOSS_LIMIT" not in paper_risk_failures,
-                "Max trades": "MAX_TRADES_REACHED" not in paper_risk_failures,
-                "Open positions": "OPEN_POSITION_LIMIT" not in paper_risk_failures,
-            }
-            check_df = pd.DataFrame(
-                [{"Check": k, "Status": "PASS" if v else "FAIL"} for k, v in checks.items()]
+        if st.button("Save signal audit", use_container_width=True):
+            audit_signal(
+                getattr(user, "id", ""),
+                workspace.get("id"),
+                signal_json,
             )
-            st.dataframe(check_df, use_container_width=True, hide_index=True)
-    
-            st.markdown('<div class="section-head">Key Levels</div>', unsafe_allow_html=True)
-            level_df = pd.DataFrame(
-                [{"Level": k.replace("_", " ").title(), "Value": v} for k, v in levels.items()]
-            )
-            st.dataframe(level_df, use_container_width=True, hide_index=True)
-    
-            st.markdown('<div class="section-head">Reasons / Invalidations</div>', unsafe_allow_html=True)
-            r1, r2 = st.columns(2)
-            with r1:
-                st.markdown("**Reason codes**")
-                if reasons:
-                    for x in reasons:
-                        st.markdown(f'<div class="reason-item">✅ {x}</div>', unsafe_allow_html=True)
-                else:
-                    st.markdown('<div class="reason-item">No positive reason code.</div>', unsafe_allow_html=True)
-            with r2:
-                st.markdown("**Invalidations / blocks**")
-                if invalidations:
-                    for x in invalidations:
-                        st.markdown(f'<div class="reason-item">⛔ {x}</div>', unsafe_allow_html=True)
-                else:
-                    st.markdown('<div class="reason-item status-pass">✓ None</div>', unsafe_allow_html=True)
-    
-            st.markdown('<div class="section-head">Validated Candle Data</div>', unsafe_allow_html=True)
-            st.dataframe(
-                df.tail(50)[
-                    ["timestamp", "open", "high", "low", "close", "volume", "vwap",
-                     "ma_fast", "ma_slow", "ema_5", "ema_8", "ema_5_8_spread",
-                     "rsi", "macd", "macd_signal", "atr", "adx"]
-                ],
-                use_container_width=True,
-                hide_index=True,
-                height=420,
-            )
-    
-            st.download_button(
-                "Download Signal JSON",
-                data=json.dumps(signal_json, indent=2, default=str),
-                file_name="trade_easy_signal.json",
-                mime="application/json",
-                use_container_width=True,
-            )
-    
-            if st.button("Save signal audit", use_container_width=True):
-                audit_signal(
-                    getattr(user, "id", ""),
-                    workspace.get("id"),
-                    signal_json,
-                )
-                st.success("Signal audit save request completed.")
+            st.success("Signal audit save request completed.")
     
 
-    # Invisible strategy polling fragment: it writes to strategy_root only when
-    # a new confirmed strategy or paper-trade event is detected.
+    # Live strategy fragment: renders the complete dynamic strategy/dashboard
+    # output directly in the fragment so Streamlit Cloud can safely rerun it.
     if hasattr(st, "fragment"):
         _render_full_dashboard = st.fragment(
             run_every="1s", key="trade_easy_strategy_dashboard"
