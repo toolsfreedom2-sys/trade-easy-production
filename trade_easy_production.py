@@ -154,6 +154,10 @@ FIXED_STOP_LOSS_POINTS = 25.0
 # Live-data reliability settings. WebSocket is the primary source; Quotes
 # REST is a guarded fallback only when the socket is stale or unavailable.
 LIVE_TICK_MAX_AGE_SECONDS = 3.0
+
+# UI display cadence: boxes stay mounted; only live values are refreshed.
+DASHBOARD_DISPLAY_TICK_INTERVAL_SECONDS = 1.0
+
 QUOTE_FALLBACK_INTERVAL_SECONDS = 2.0
 VIX_REFRESH_INTERVAL_SECONDS = 5.0
 HISTORY_REFRESH_INTERVAL_SECONDS = 10.0
@@ -4075,6 +4079,31 @@ def dashboard(user, workspace):
         transition: none !important;
         animation: none !important;
     }
+
+    /* TRUE NO-DIM MODE: Streamlit marks old fragment nodes as stale while
+       the replacement tree is being committed. Never fade/dim those nodes.
+       This makes the dashboard look continuously solid while only the
+       numeric/content values are replaced. */
+    .element-container,
+    [data-testid="stElementContainer"],
+    [data-testid="stAppViewBlockContainer"],
+    [data-stale="true"],
+    .element-container[data-stale="true"],
+    [data-testid="stElementContainer"][data-stale="true"] {
+        opacity: 1 !important;
+        filter: none !important;
+        transition: none !important;
+        animation: none !important;
+    }
+
+    /* Prevent Chromium paint/compositing flashes during frequent text updates. */
+    .te-live-stable-root {
+        opacity: 1 !important;
+        filter: none !important;
+        transition: none !important;
+        animation: none !important;
+        contain: layout paint style;
+    }
     /* Compact live ticker: one visual block, not five separate Streamlit widgets. */
     .live-ticker-shell { margin: 8px 0 14px; padding: 10px 12px; border: 1px solid rgba(120,150,210,.18); border-radius: 12px; background: rgba(9,18,38,.72); }
     .live-ticker-top { font-size: .78rem; color: #9fb0ca; margin-bottom: 8px; }
@@ -4092,7 +4121,8 @@ def dashboard(user, workspace):
     .live-event { margin-top:8px; padding:7px 9px; border-radius:8px; background:rgba(255,190,70,.08); color:#ffd77c; font-size:.75rem; }
     @media (max-width: 900px) { .live-ticker-grid { grid-template-columns: repeat(3, minmax(0,1fr)); } }
     /* Keep the browser viewport stable while the fragment updates. */
-    html, body { scroll-behavior: auto !important; }
+    html, body { scroll-behavior: auto !important; overflow-anchor: none !important; }
+    [data-testid="stAppViewContainer"], [data-testid="stMain"] { overflow-anchor: none !important; }
 
     /* TOP HEADER + LOGOUT VISIBILITY FIX
        Keep Streamlit's top header from appearing as a white strip over the
@@ -4413,13 +4443,29 @@ def dashboard(user, workspace):
             "quote_error": quote_error,
         }
 
+    # Persistent target container: Streamlit 1.63+ can redraw a fragment into
+    # a container created during the full app run. The outer shell therefore
+    # keeps its position/geometry while only the live values inside are replaced.
+    live_ticker_root = st.container(key="trade_easy_live_ticker_root")
+    with live_ticker_root:
+        st.markdown(
+            "<div class='te-live-stable-root'><div class='live-ticker-shell'><div class='live-ticker-top'><b>MARKET DATA</b> • connecting…</div></div></div>",
+            unsafe_allow_html=True,
+        )
+
+    def _render_live_ticker_target():
+        with live_ticker_root:
+            _render_live_ticker()
+
     if hasattr(st, "fragment"):
-        _live_fragment = st.fragment(run_every="1s", key="trade_easy_live_ticker")(_render_live_ticker)
+        _live_fragment = st.fragment(run_every=DASHBOARD_DISPLAY_TICK_INTERVAL_SECONDS, key="trade_easy_live_ticker")(_render_live_ticker_target)
         _live_fragment()
     else:
-        _render_live_ticker()
+        with live_ticker_root:
+            _render_live_ticker()
 
-    # Option Chain: keep the complete render tree inside its own fragment.
+    # Option Chain: keep the complete render tree inside a persistent keyed
+    # target so its frame/geometry stays in place while only numbers change.
     # This avoids updating an external st.empty() placeholder from a fragment,
     # which can produce DuplicateElement errors on Streamlit Cloud.
     def _option_chain_fingerprint(df, live_px):
@@ -4433,60 +4479,68 @@ def dashboard(user, workspace):
             raw = repr(temp.to_dict("records")).encode()
         return hashlib.sha256(raw).hexdigest()
 
-    @st.fragment(run_every="2s", key="trade_easy_option_chain")
+    option_chain_root = st.container(key="trade_easy_option_chain_root")
+    with option_chain_root:
+        st.markdown(
+            "<div class='te-live-stable-root'><div class='te-oc-wrap' style='min-height:120px'><div class='te-oc-head'><div class='te-oc-title'>📊 Option Chain <span style='color:#5eead4'>• LIVE READ-ONLY</span></div><div class='te-oc-meta'>connecting…</div></div></div></div>",
+            unsafe_allow_html=True,
+        )
+
+    @st.fragment(run_every=DASHBOARD_DISPLAY_TICK_INTERVAL_SECONDS, key="trade_easy_option_chain")
     def _render_live_option_chain():
-        market_live, session_label = india_market_status()
-        token = st.session_state.get("fyers_access_token")
-        appid = st.session_state.get("fyers_app_id", "").strip()
+        with option_chain_root:
+            market_live, session_label = india_market_status()
+            token = st.session_state.get("fyers_access_token")
+            appid = st.session_state.get("fyers_app_id", "").strip()
 
-        st.markdown('<div class="section-head">📊 Option Chain</div>', unsafe_allow_html=True)
+            st.markdown('<div class="section-head">📊 Option Chain</div>', unsafe_allow_html=True)
 
-        if not token or not appid:
-            cols = st.columns(6)
-            for col, label in zip(cols, ["ATM / Spot", "PCR", "Max Pain", "CALL OI", "PUT OI", "OI Change"]):
-                col.metric(label, "—")
-            st.caption("Waiting for FYERS data connection.")
-            return
+            if not token or not appid:
+                cols = st.columns(6)
+                for col, label in zip(cols, ["ATM / Spot", "PCR", "Max Pain", "CALL OI", "PUT OI", "OI Change"]):
+                    col.metric(label, "—")
+                st.caption("Waiting for FYERS data connection.")
+                return
 
-        if not market_live:
-            cached_df = (st.session_state.get("trade_easy_option_chain_cache_by_symbol", {}) or {}).get(symbol)
-            chain_df, chain_err = cached_df, None
+            if not market_live:
+                cached_df = (st.session_state.get("trade_easy_option_chain_cache_by_symbol", {}) or {}).get(symbol)
+                chain_df, chain_err = cached_df, None
+                if chain_df is None or chain_df.empty:
+                    try:
+                        chain_df, chain_err = option_chain_snapshot(token, appid, symbol, min_interval=5.0)
+                    except Exception as exc:
+                        chain_err = str(exc)
+                chain_live_price = st.session_state.get("trade_easy_live_price_cached")
+                if chain_df is not None and not chain_df.empty:
+                    render_professional_option_chain(chain_df, chain_live_price, index_name, strike_count=10)
+                    st.caption("⚪ Market closed • option-chain snapshot is static")
+                else:
+                    st.caption(f"Option Chain unavailable: {chain_err or 'no cached data'}")
+                return
+
+            live_now = fyers_live_feed(token, appid, symbol)
+            chain_live_price = parse_live_price(live_now.get("latest")) or live_now.get("last_tick_price")
+            if chain_live_price is None:
+                chain_live_price = st.session_state.get("trade_easy_live_price_cached")
+
+            chain_df, chain_err = option_chain_snapshot(token, appid, symbol, min_interval=5.0)
+            option_ticks = fyers_option_live_feed(token, appid, chain_df)
+            chain_df = merge_option_ticks(chain_df, option_ticks)
             if chain_df is None or chain_df.empty:
-                try:
-                    chain_df, chain_err = option_chain_snapshot(token, appid, symbol, min_interval=5.0)
-                except Exception as exc:
-                    chain_err = str(exc)
-            chain_live_price = st.session_state.get("trade_easy_live_price_cached")
-            if chain_df is not None and not chain_df.empty:
-                render_professional_option_chain(chain_df, chain_live_price, index_name, strike_count=10)
-                st.caption("⚪ Market closed • option-chain snapshot is static")
-            else:
-                st.caption(f"Option Chain unavailable: {chain_err or 'no cached data'}")
-            return
+                st.caption(f"Option Chain data unavailable: {chain_err or 'no CE/PE rows returned'}")
+                if live_now.get("error"):
+                    st.warning(f"Market data socket: {live_now.get('error')}")
+                return
 
-        live_now = fyers_live_feed(token, appid, symbol)
-        chain_live_price = parse_live_price(live_now.get("latest")) or live_now.get("last_tick_price")
-        if chain_live_price is None:
-            chain_live_price = st.session_state.get("trade_easy_live_price_cached")
-
-        chain_df, chain_err = option_chain_snapshot(token, appid, symbol, min_interval=5.0)
-        option_ticks = fyers_option_live_feed(token, appid, chain_df)
-        chain_df = merge_option_ticks(chain_df, option_ticks)
-        if chain_df is None or chain_df.empty:
-            st.caption(f"Option Chain data unavailable: {chain_err or 'no CE/PE rows returned'}")
-            if live_now.get("error"):
-                st.warning(f"Market data socket: {live_now.get('error')}")
-            return
-
-        # Always render the latest good chain. The snapshot layer itself is
-        # throttled, so this fragment does not hammer the option-chain endpoint.
-        fp = _option_chain_fingerprint(chain_df, chain_live_price)
-        st.session_state["trade_easy_option_display_fingerprint"] = fp
-        render_professional_option_chain(chain_df, chain_live_price, index_name, strike_count=10)
-        status = live_now.get("status") or ("LIVE" if live_now.get("connected") else "RECONNECTING")
-        st.caption(f"🟢 Option Chain • {status} • snapshot refresh throttled • {symbol}")
-        if chain_err:
-            st.caption(f"Last refresh warning: {chain_err} • showing latest available data")
+            # Always render the latest good chain. The snapshot layer itself is
+            # throttled, so this fragment does not hammer the option-chain endpoint.
+            fp = _option_chain_fingerprint(chain_df, chain_live_price)
+            st.session_state["trade_easy_option_display_fingerprint"] = fp
+            render_professional_option_chain(chain_df, chain_live_price, index_name, strike_count=10)
+            status = live_now.get("status") or ("LIVE" if live_now.get("connected") else "RECONNECTING")
+            st.caption(f"🟢 Option Chain • {status} • live tick: 1s • OI snapshot: guarded 5s • {symbol}")
+            if chain_err:
+                st.caption(f"Last refresh warning: {chain_err} • showing latest available data")
 
     _render_live_option_chain()
 
@@ -5490,13 +5544,28 @@ def dashboard(user, workspace):
             st.success("Signal audit save request completed.")
     
 
-    # Live strategy fragment: renders the complete dynamic strategy/dashboard
-    # output directly in the fragment so Streamlit Cloud can safely rerun it.
+    # Persistent strategy target: the outer geometry stays mounted while the
+    # fragment redraws only the dynamic values/panels inside it. This is the key
+    # part of the stable-dashboard behaviour requested by the user.
+    strategy_dashboard_root = st.container(key="trade_easy_strategy_dashboard_root")
+    with strategy_dashboard_root:
+        st.markdown(
+            "<div class='te-live-stable-root'><div class='section-head'>Trade Easy Strategy Dashboard</div><div class='live-ticker-shell' style='min-height:100px'><div class='live-ticker-top'><b>LIVE DATA</b> • connecting…</div></div></div>",
+            unsafe_allow_html=True,
+        )
+
+    def _render_full_dashboard_target():
+        with strategy_dashboard_root:
+            _render_full_dashboard()
+
     if hasattr(st, "fragment"):
-        _render_full_dashboard = st.fragment(
-            run_every="1s", key="trade_easy_strategy_dashboard"
-        )(_render_full_dashboard)
-    _render_full_dashboard()
+        _render_full_dashboard_fragment = st.fragment(
+            run_every=DASHBOARD_DISPLAY_TICK_INTERVAL_SECONDS, key="trade_easy_strategy_dashboard"
+        )(_render_full_dashboard_target)
+        _render_full_dashboard_fragment()
+    else:
+        with strategy_dashboard_root:
+            _render_full_dashboard()
 
 # ============================================================
 # PASSWORD RECOVERY: DEFAULT SUPABASE EMAIL (NO CUSTOM SMTP)
