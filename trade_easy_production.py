@@ -101,7 +101,7 @@ if not SUPABASE_URL or not SUPABASE_PUBLISHABLE_KEY:
 if not TRADE_EASY_PUBLIC_URL:
     st.warning(
         "TRADE_EASY_PUBLIC_URL is not configured. Set it to the deployed "
-        "https://*.streamlit.app URL before using Google/FYERS OAuth."
+        "https://*.streamlit.app URL before using FYERS OAuth."
     )
 
 
@@ -150,6 +150,14 @@ MEANINGFUL_MOVE_MIN_POINTS = {
 PAPER_FIXED_QUANTITY = 65
 FIXED_TARGET_POINTS = 62.0
 FIXED_STOP_LOSS_POINTS = 25.0
+
+# Live-data reliability settings. WebSocket is the primary source; Quotes
+# REST is a guarded fallback only when the socket is stale or unavailable.
+LIVE_TICK_MAX_AGE_SECONDS = 3.0
+QUOTE_FALLBACK_INTERVAL_SECONDS = 2.0
+VIX_REFRESH_INTERVAL_SECONDS = 5.0
+HISTORY_REFRESH_INTERVAL_SECONDS = 10.0
+
 
 
 def fyers_credentials_present():
@@ -315,30 +323,52 @@ def fyers_fetch_history(access_token, app_id, symbol, resolution=5, days=5):
 
 
 def fyers_fetch_quote(access_token, app_id, symbol):
-    """Fetch latest LTP through FYERS Quotes API."""
+    """Fetch latest LTP through FYERS Quotes API with defensive response parsing."""
     fy = fyers_model(access_token, app_id)
     if fy is None:
         return None, "FYERS SDK उपलब्ध नहीं है।"
+    symbol = str(symbol or "").strip()
+    if not symbol:
+        return None, "FYERS symbol missing है।"
     try:
         response = fy.quotes(data={"symbols": symbol})
-        if not isinstance(response, dict) or response.get("s") not in ("ok", "success"):
+        if not isinstance(response, dict):
+            return None, f"FYERS quotes unexpected response: {response!r}"
+        if str(response.get("s", "")).lower() == "error":
             return None, f"FYERS quotes error: {response}"
+
         items = response.get("d") or []
         if isinstance(items, dict):
             items = [items]
+        if not isinstance(items, list):
+            return None, f"FYERS quotes 'd' invalid: {response}"
+
+        # Prefer the exact requested symbol if multiple entries are returned.
+        ordered = []
         for item in items:
             if not isinstance(item, dict):
                 continue
+            item_symbol = str(item.get("n") or item.get("symbol") or "").strip()
+            if item_symbol == symbol:
+                ordered.insert(0, item)
+            else:
+                ordered.append(item)
+
+        for item in ordered:
             value = item.get("v") if isinstance(item.get("v"), dict) else item
+            if not isinstance(value, dict):
+                continue
             for key in ("lp", "ltp", "LTP"):
-                if key in value:
+                if key in value and value.get(key) not in (None, ""):
                     try:
-                        return float(value[key]), None
+                        px = float(value[key])
+                        if np.isfinite(px) and px > 0:
+                            return px, None
                     except (TypeError, ValueError):
                         pass
-        return None, f"FYERS quotes response में LTP नहीं मिला: {response}"
+        return None, f"FYERS quotes response में {symbol} का LTP नहीं मिला: {response}"
     except Exception as exc:
-        return None, f"FYERS quotes exception: {exc}"
+        return None, f"FYERS quotes exception: {type(exc).__name__}: {exc}"
 
 
 def india_market_status(now=None):
@@ -556,8 +586,12 @@ def fyers_option_live_feed(access_token, app_id, chain_df):
     def on_connect():
         try:
             socket.subscribe(symbols=symbols, data_type="SymbolUpdate")
-        except Exception:
-            pass
+            # FYERS official v3 pattern keeps the socket event loop alive from
+            # the on_connect callback. This also keeps reconnect subscriptions
+            # consistent after a dropped connection.
+            socket.keep_running()
+        except Exception as exc:
+            on_error(exc)
 
     socket = data_ws.FyersDataSocket(
         access_token=f"{app_id}:{access_token}", log_path="", litemode=False,
@@ -567,9 +601,8 @@ def fyers_option_live_feed(access_token, app_id, chain_df):
     def runner():
         try:
             socket.connect()
-            socket.keep_running()
-        except Exception:
-            pass
+        except Exception as exc:
+            on_error(exc)
     thread = threading.Thread(target=runner, daemon=True, name="trade-easy-option-ws")
     with _OPTION_WS_LOCK:
         _OPTION_WS_CACHE[key] = {"ticks": ticks, "thread": thread, "socket": socket, "symbols": set(symbols)}
@@ -1183,62 +1216,128 @@ def level_setup_engine(price, direction, bias, levels, score, confirmation_count
         return {"status":"ENTRY ZONE","trade_type":trade_type,"reason":"LEVEL_NOT_RETESTED","path":path}
     return {"status":"CONFIRMED","trade_type":trade_type,"reason":"ALL_LEVEL_FILTERS_PASS","path":path}
 
+def _normalized_ws_access_token(app_id, access_token):
+    """Return FYERS websocket auth in canonical app_id:access_token form."""
+    app_id = str(app_id or "").strip()
+    token = str(access_token or "").strip()
+    if not app_id or not token:
+        return ""
+    # Avoid accidentally sending APPID:APPID:TOKEN when a stored token already
+    # contains the app-id prefix.
+    if token.startswith(app_id + ":"):
+        return token
+    return f"{app_id}:{token}"
+
+
 _WS_CACHE = {}
 _WS_CACHE_LOCK = threading.Lock()
 
-def fyers_live_feed(access_token, app_id, symbol):
-    """Return one persistent daemon WebSocket state per token/symbol key.
+def _make_live_ws_state():
+    return {
+        "latest": None,
+        "last_tick_price": None,
+        "last_tick_received": None,
+        "last_tick_symbol": None,
+        "tick_count": 0,
+        "connected": False,
+        "subscribed": False,
+        "error": None,
+        "status": "DISCONNECTED",
+        "started": time.time(),
+    }
 
-    IMPORTANT: this function must not create a new FYERS socket on every
-    Streamlit fragment rerun; doing so causes duplicate sockets, excess CPU,
-    and visible dashboard instability.
+
+def fyers_live_feed(access_token, app_id, symbol):
+    """Return one persistent FYERS v3 DataSocket state for a symbol.
+
+    The official FYERS sample subscribes in on_connect and keeps the socket
+    running from that callback. Using that pattern here avoids a common silent
+    'connected but no ticks' situation. The same feed is reused by the ticker,
+    strategy engine and option-chain renderer so the app does not open duplicate
+    index sockets on every Streamlit fragment rerun.
     """
-    cache_key = f"{app_id}:{symbol}:{hashlib.sha256(str(access_token).encode()).hexdigest()[:12]}"
+    token = str(access_token or "").strip()
+    app_id = str(app_id or "").strip()
+    symbol = str(symbol or "").strip()
+    if not token or not app_id or not symbol:
+        return {
+            **_make_live_ws_state(),
+            "error": "FYERS app_id/access_token/symbol missing है।",
+            "status": "CONFIG_ERROR",
+        }
+    if not FYERS_SDK_OK or data_ws is None:
+        return {
+            **_make_live_ws_state(),
+            "error": "FYERS WebSocket SDK उपलब्ध नहीं है।",
+            "status": "SDK_MISSING",
+        }
+
+    cache_key = f"{app_id}:{symbol}:{hashlib.sha256(token.encode()).hexdigest()[:16]}"
     with _WS_CACHE_LOCK:
         cached = _WS_CACHE.get(cache_key)
-        if cached and cached.get("thread") and cached["thread"].is_alive():
-            return cached["state"]
+        if cached:
+            thread = cached.get("thread")
+            if thread and thread.is_alive():
+                return cached["state"]
+            # If the previous thread died, let the next call create a fresh
+            # connection instead of returning a dead state forever.
+            _WS_CACHE.pop(cache_key, None)
 
-        state = {"latest": None, "error": None, "connected": False, "started": time.time(),
-                 "last_tick_received": None, "last_tick_price": None, "tick_count": 0}
+        state = _make_live_ws_state()
         lock = threading.Lock()
 
-    if not FYERS_SDK_OK or data_ws is None:
-        state["error"] = "FYERS WebSocket SDK उपलब्ध नहीं है।"
-        return state
+    socket_box = {"socket": None}
 
     def on_message(message):
         price = parse_live_price(message)
+        symbol_from_message = None
+        if isinstance(message, dict):
+            symbol_from_message = message.get("symbol") or message.get("n")
         with lock:
             state["latest"] = message
-            state["connected"] = True
-            state["last_tick_received"] = time.time()
+            if symbol_from_message:
+                state["last_tick_symbol"] = str(symbol_from_message)
+            state["tick_count"] = int(state.get("tick_count", 0)) + 1
             if price is not None:
                 state["last_tick_price"] = float(price)
-            state["tick_count"] = int(state.get("tick_count", 0)) + 1
-            state["error"] = None
+                state["last_tick_received"] = time.time()
+                state["status"] = "LIVE"
+                state["error"] = None
+            elif state.get("status") not in {"LIVE", "SUBSCRIBING"}:
+                state["status"] = "CONNECTED"
 
     def on_error(message):
         with lock:
-            state["error"] = str(message)
             state["connected"] = False
+            state["subscribed"] = False
+            state["status"] = "ERROR"
+            state["error"] = str(message)
 
     def on_close(message):
         with lock:
             state["connected"] = False
+            state["subscribed"] = False
+            state["status"] = "RECONNECTING"
             state["error"] = str(message) if message else "WebSocket closed; reconnecting"
 
     def on_connect():
         try:
-            socket.subscribe(symbols=[symbol], data_type="SymbolUpdate")
+            sock = socket_box["socket"]
+            state["status"] = "SUBSCRIBING"
+            sock.subscribe(symbols=[symbol], data_type="SymbolUpdate")
             with lock:
                 state["connected"] = True
+                state["subscribed"] = True
+                state["status"] = "CONNECTED"
                 state["error"] = None
+            # Official FYERS v3 pattern: keep the socket event loop alive from
+            # the connect callback itself.
+            sock.keep_running()
         except Exception as exc:
             on_error(exc)
 
-    socket = data_ws.FyersDataSocket(
-        access_token=f"{app_id}:{access_token}",
+    ws = data_ws.FyersDataSocket(
+        access_token=_normalized_ws_access_token(app_id, token),
         log_path="",
         litemode=False,
         write_to_file=False,
@@ -1248,17 +1347,25 @@ def fyers_live_feed(access_token, app_id, symbol):
         on_error=on_error,
         on_message=on_message,
     )
+    socket_box["socket"] = ws
 
     def runner():
         try:
-            socket.connect()
-            socket.keep_running()
+            ws.connect()
         except Exception as exc:
             on_error(exc)
 
-    thread = threading.Thread(target=runner, daemon=True, name="trade-easy-fyers-ws")
+    thread = threading.Thread(
+        target=runner,
+        daemon=True,
+        name=f"trade-easy-fyers-ws-{symbol.replace(':','_').replace('-','_')}",
+    )
     with _WS_CACHE_LOCK:
-        _WS_CACHE[cache_key] = {"state": state, "thread": thread, "socket": socket}
+        _WS_CACHE[cache_key] = {
+            "state": state,
+            "thread": thread,
+            "socket": ws,
+        }
     thread.start()
     return state
 
@@ -1273,116 +1380,35 @@ def parse_live_price(message):
         return None
     if not isinstance(message, dict):
         return None
+
+    # FYERS v3 SymbolUpdate/lite payloads expose ltp at the top level.
     for key in ("ltp", "lp", "LTP"):
         if key in message:
             try:
-                return float(message[key])
-            except Exception:
+                px = float(message[key])
+                if np.isfinite(px) and px > 0:
+                    return px
+            except (TypeError, ValueError):
                 pass
-    d = message.get("d")
-    if isinstance(d, dict):
-        for key in ("ltp", "lp", "LTP"):
-            if key in d:
-                try:
-                    return float(d[key])
-                except Exception:
-                    pass
+
+    # Some gateway/adapter responses can wrap the data in d/v.
+    for parent_key in ("d", "v"):
+        parent = message.get(parent_key)
+        if isinstance(parent, dict):
+            for key in ("ltp", "lp", "LTP"):
+                if key in parent:
+                    try:
+                        px = float(parent[key])
+                        if np.isfinite(px) and px > 0:
+                            return px
+                    except (TypeError, ValueError):
+                        pass
     return None
 
 
-_LTP_WS_CACHE = {}
-_LTP_WS_LOCK = threading.Lock()
-
-
 def fyers_ltp_feed(access_token, app_id, symbol):
-    """Persistent FYERS LTP-only websocket for the trader-facing live ticker.
-
-    Lite mode is intentionally used here because the ticker needs only LTP and
-    tick timestamps. The heavier SymbolUpdate feed remains available separately
-    for option contracts/analytics. This avoids starving the LTP ticker when the
-    option chain has many subscribed contracts.
-    """
-    if not FYERS_SDK_OK or data_ws is None or not access_token or not app_id or not symbol:
-        return {
-            "latest": None,
-            "last_tick_price": None,
-            "last_tick_received": None,
-            "tick_count": 0,
-            "connected": False,
-            "error": "FYERS WebSocket unavailable",
-        }
-
-    key = f"{app_id}:{symbol}:{hashlib.sha256(str(access_token).encode()).hexdigest()[:16]}"
-    with _LTP_WS_LOCK:
-        cached = _LTP_WS_CACHE.get(key)
-        if cached and cached.get("thread") and cached["thread"].is_alive():
-            return cached["state"]
-        state = {
-            "latest": None,
-            "last_tick_price": None,
-            "last_tick_received": None,
-            "tick_count": 0,
-            "connected": False,
-            "error": None,
-        }
-        lock = threading.Lock()
-
-    def on_message(message):
-        if not isinstance(message, dict):
-            return
-        price = parse_live_price(message)
-        with lock:
-            state["latest"] = message
-            state["connected"] = True
-            state["last_tick_received"] = time.time()
-            if price is not None:
-                state["last_tick_price"] = float(price)
-            state["tick_count"] = int(state.get("tick_count", 0)) + 1
-            state["error"] = None
-
-    def on_error(message):
-        with lock:
-            state["connected"] = False
-            state["error"] = str(message)
-
-    def on_close(message):
-        with lock:
-            state["connected"] = False
-            state["error"] = str(message) if message else "WebSocket closed; reconnecting"
-
-    def on_connect():
-        try:
-            socket.subscribe(symbols=[symbol], data_type="SymbolUpdate")
-            with lock:
-                state["connected"] = True
-                state["error"] = None
-        except Exception as exc:
-            on_error(exc)
-
-    socket = data_ws.FyersDataSocket(
-        access_token=f"{app_id}:{access_token}",
-        log_path="",
-        litemode=True,
-        write_to_file=False,
-        reconnect=True,
-        on_connect=on_connect,
-        on_close=on_close,
-        on_error=on_error,
-        on_message=on_message,
-    )
-
-    def runner():
-        try:
-            socket.connect()
-            socket.keep_running()
-        except Exception as exc:
-            on_error(exc)
-
-    thread = threading.Thread(target=runner, daemon=True, name="trade-easy-ltp-ws")
-    with _LTP_WS_LOCK:
-        _LTP_WS_CACHE[key] = {"state": state, "thread": thread, "socket": socket}
-    thread.start()
-    return state
+    """Backward-compatible alias to the single canonical live feed."""
+    return fyers_live_feed(access_token, app_id, symbol)
 
 
 # ============================================================
@@ -2882,7 +2908,7 @@ def login_page():
                 except Exception as e:
                     st.error(f"Login error: {e}")
 
-            forgot_left, forgot_col, forgot_right = st.columns([1, 20, 1])
+            forgot_left, forgot_col, forgot_right = st.columns([1, 1.35, 1])
             with forgot_col:
                 if st.button("Forgot Password?", use_container_width=True, key="forgot_password_btn"):
                     if not email.strip():
@@ -4230,6 +4256,7 @@ def dashboard(user, workspace):
         st.caption("Live market data is managed in the background. Broker credentials and connection controls are hidden from normal users.")
         index_name = st.selectbox("Trading Index", list(INDEX_SYMBOLS.keys()), index=0)
         symbol = INDEX_SYMBOLS[index_name]
+        st.session_state["fyers_symbol"] = symbol
         timeframe = st.selectbox("Entry timeframe", [1, 5, 15, 30], index=1)
         risk_amount = st.number_input("Allowed risk amount", min_value=0.0, value=1000.0, step=100.0)
         min_rr = st.number_input("Minimum Risk/Reward", min_value=1.0, value=1.5, step=0.1)
@@ -4264,123 +4291,76 @@ def dashboard(user, workspace):
 
 
     # ================================================================
-    # TOP LIVE LAYER — PRICE-ONLY LIVE CELL
-    # Static labels/layout are created once. The fragment updates only the
-    # numeric cells that actually need a new value. Outside market hours there
-    # is no broker refresh loop; the last-known display stays quiet.
+    # TOP LIVE LAYER — SINGLE FRAGMENT RENDER ROOT
+    # The previous version created st.empty()/st.metric elements outside the
+    # fragment and then updated those placeholders from inside the fragment.
+    # On Streamlit Cloud this can trigger StreamlitDuplicateElementId/Key errors
+    # during fragment reruns. The live ticker now owns its complete visual tree
+    # on every fragment run, which keeps the DOM stable and removes that error.
     # ================================================================
-    live_ticker_root = st.container()
-    with live_ticker_root:
-        live_cols = st.columns([1.35, 1.0, 0.9, 0.9, 0.85, 1.0])
-        with live_cols[0]:
-            st.caption("LIVE PRICE")
-            live_price_box = st.empty()
-        with live_cols[1]:
-            st.caption("PAPER P&L")
-            live_pnl_box = st.empty()
-        with live_cols[2]:
-            st.caption("POSITION")
-            live_position_box = st.empty()
-        with live_cols[3]:
-            st.caption("ENTRY")
-            live_entry_box = st.empty()
-        with live_cols[4]:
-            st.caption("MARKET")
-            live_market_box = st.empty()
-        with live_cols[5]:
-            st.caption("INDIA VIX")
-            live_vix_box = st.empty()
-
-    def _render_paper_cells(force=False):
-        cache = st.session_state.setdefault("trade_easy_paper_display", {})
-        version = int(cache.get("version", 0))
-        if not force and version == int(st.session_state.get("trade_easy_paper_rendered_version", -1)):
-            return
-        pos = cache.get("open_position")
-        realized = float(cache.get("daily_realized_pnl", 0.0))
-        unreal = float(cache.get("unrealized_pnl", 0.0))
-        live_pnl_box.markdown(f"<div style='font-size:1.05rem;font-weight:750'>₹{realized + unreal:,.2f}</div>", unsafe_allow_html=True)
-        live_position_box.markdown(f"<div style='font-size:1.05rem;font-weight:750'>{pos.get('direction','FLAT') if pos else 'FLAT'}</div>", unsafe_allow_html=True)
-        live_entry_box.markdown(
-            f"<div style='font-size:1.05rem;font-weight:750'>₹{float(pos.get('entry_price')):,.2f}</div>"
-            if pos else "<div style='font-size:1.05rem;font-weight:750'>—</div>",
-            unsafe_allow_html=True,
-        )
-        st.session_state["trade_easy_paper_rendered_version"] = version
-
-    def _set_market_cell(label):
-        if label != st.session_state.get("trade_easy_market_label_rendered"):
-            live_market_box.markdown(f"<div style='font-size:.98rem;font-weight:750'>{label}</div>", unsafe_allow_html=True)
-            st.session_state["trade_easy_market_label_rendered"] = label
-
     def _render_live_ticker():
         market_live, session_label = india_market_status()
         token = st.session_state.get("fyers_access_token")
         appid = st.session_state.get("fyers_app_id", "").strip()
         sym = st.session_state.get("fyers_symbol", symbol)
-        _render_paper_cells(force=not st.session_state.get("trade_easy_paper_rendered_once", False))
-        st.session_state["trade_easy_paper_rendered_once"] = True
 
-        # Closed/pre-market: one optional snapshot after app/session start, then NO
-        # quote/VIX refreshes. The UI remains unchanged until the next live session.
-        if not market_live:
-            _set_market_cell("MARKET CLOSED" if session_label == "MARKET CLOSED" else session_label)
-            if not st.session_state.get("trade_easy_closed_price_initialized"):
-                closed_px = st.session_state.get("trade_easy_live_price_cached")
-                if closed_px is None and token and appid:
-                    try:
-                        qpx, _ = fyers_fetch_quote(token, appid, sym)
-                        if qpx is not None:
-                            closed_px = float(qpx)
-                            st.session_state["trade_easy_live_price_cached"] = closed_px
-                    except Exception:
-                        pass
-                if closed_px is not None:
-                    live_price_box.markdown(f"<div style='font-size:1.45rem;font-weight:800;line-height:1.1'>₹{float(closed_px):,.2f}</div>", unsafe_allow_html=True)
-                elif not st.session_state.get("trade_easy_live_price_rendered"):
-                    live_price_box.markdown("<div style='font-size:1.45rem;font-weight:800'>—</div>", unsafe_allow_html=True)
-                st.session_state["trade_easy_closed_price_initialized"] = True
-            return
+        paper_cache = st.session_state.setdefault("trade_easy_paper_display", {})
+        pos = paper_cache.get("open_position")
+        realized = float(paper_cache.get("daily_realized_pnl", 0.0))
+        unreal = float(paper_cache.get("unrealized_pnl", 0.0))
+        paper_total = realized + unreal
 
-        # Live session starts: unlock one live refresh loop.
-        st.session_state["trade_easy_closed_price_initialized"] = False
-        _set_market_cell("LIVE")
+        px = None
+        tick_age = None
+        ws_status = "WAITING"
+        ws_error = None
+        quote_error = None
+        vix = None
+        vix_trend = "—"
 
-        if not token or not appid:
-            return
+        if market_live and token and appid:
+            live = fyers_live_feed(token, appid, sym)
+            px = parse_live_price(live.get("latest")) or live.get("last_tick_price")
+            tick_received = live.get("last_tick_received")
+            tick_age = (time.time() - float(tick_received)) if tick_received else None
+            ws_status = str(live.get("status") or ("CONNECTED" if live.get("connected") else "RECONNECTING"))
+            ws_error = live.get("error")
 
-        live = fyers_ltp_feed(token, appid, sym)
-        px = parse_live_price(live.get("latest"))
-        if px is None:
-            px = live.get("last_tick_price")
-        tick_received = live.get("last_tick_received")
-        tick_age = (time.time() - float(tick_received)) if tick_received else None
+            # REST quote is a guarded safety net only when the WebSocket is
+            # missing/stale. This prevents a blank LTP when the socket is still
+            # reconnecting, while preserving the WebSocket as the primary feed.
+            if px is None or tick_age is None or tick_age > LIVE_TICK_MAX_AGE_SECONDS:
+                last_quote_at = float(st.session_state.get("trade_easy_ticker_quote_at", 0.0))
+                if time.time() - last_quote_at >= QUOTE_FALLBACK_INTERVAL_SECONDS:
+                    qpx, qerr = fyers_fetch_quote(token, appid, sym)
+                    st.session_state["trade_easy_ticker_quote_at"] = time.time()
+                    st.session_state["trade_easy_ticker_quote_error"] = qerr
+                    if qpx is not None:
+                        st.session_state["trade_easy_ticker_quote_price"] = float(qpx)
+                        px = float(qpx)
+                else:
+                    px = st.session_state.get("trade_easy_ticker_quote_price", px)
+            quote_error = st.session_state.get("trade_easy_ticker_quote_error")
 
-        # Quote fallback is allowed ONLY during live market hours.
-        if px is None or tick_age is None or tick_age > 1.0:
-            last_quote_at = float(st.session_state.get("trade_easy_ticker_quote_at", 0.0))
-            if time.time() - last_quote_at >= 1.0:
-                qpx, qerr = fyers_fetch_quote(token, appid, sym)
-                st.session_state["trade_easy_ticker_quote_at"] = time.time()
-                st.session_state["trade_easy_ticker_quote_error"] = qerr
-                if qpx is not None:
-                    st.session_state["trade_easy_ticker_quote_price"] = float(qpx)
-                    px = float(qpx)
-            else:
-                px = st.session_state.get("trade_easy_ticker_quote_price", px)
-
-        if px is not None:
-            px = float(px)
-            old_px = st.session_state.get("trade_easy_live_price_cached")
-            if old_px is None or abs(float(old_px) - px) >= 0.001:
-                live_price_box.markdown(f"<div style='font-size:1.45rem;font-weight:800;line-height:1.1'>₹{px:,.2f}</div>", unsafe_allow_html=True)
+            if px is not None:
+                px = float(px)
                 st.session_state["trade_easy_live_price_cached"] = px
                 st.session_state["trade_easy_live_price_rendered"] = True
 
-        # P&L changes only when a paper position exists. Once flat, it stays static.
-        cache = st.session_state.get("trade_easy_paper_display", {})
-        pos = cache.get("open_position")
-        if pos and px is not None:
+            vix, vix_trend, _vix_err = india_vix_snapshot(
+                token, appid, min_interval=VIX_REFRESH_INTERVAL_SECONDS
+            )
+        elif not market_live:
+            ws_status = session_label
+            # Outside cash-market hours, keep only the last known quote. Do not
+            # run a continuous broker refresh loop.
+            px = st.session_state.get("trade_easy_live_price_cached")
+        else:
+            ws_status = "CONFIG_ERROR"
+            ws_error = "FYERS session is not connected."
+
+        # Paper stop/target monitoring continues from the same live index price.
+        if pos and px is not None and market_live:
             px = float(px)
             sl = float(pos.get("stop_loss", 0))
             target = float(pos.get("target", 0))
@@ -4395,53 +4375,100 @@ def dashboard(user, workspace):
                     hit = "STOP_LOSS"
                 elif px <= target:
                     hit = "TARGET"
-
             if hit:
                 ps = load_paper_state(paper_user_id, paper_workspace_id)
                 closed = paper_close_position(ps, px, hit)
                 if closed:
                     save_paper_state(paper_user_id, paper_workspace_id, ps)
-                    cache["daily_realized_pnl"] = float(ps.get("daily_realized_pnl", 0.0))
-                    cache["trades_today"] = int(ps.get("trades_today", 0))
-                    cache["open_position"] = None
-                    cache["unrealized_pnl"] = 0.0
-                    cache["version"] = int(cache.get("version", 0)) + 1
-                    st.session_state["trade_easy_paper_display_version"] = cache["version"]
-                    _render_paper_cells(force=True)
-                return
+                    paper_cache.update({
+                        "daily_realized_pnl": float(ps.get("daily_realized_pnl", 0.0)),
+                        "trades_today": int(ps.get("trades_today", 0)),
+                        "open_position": None,
+                        "unrealized_pnl": 0.0,
+                        "version": int(paper_cache.get("version", 0)) + 1,
+                    })
+                    pos = None
+                    realized = float(paper_cache.get("daily_realized_pnl", 0.0))
+                    unreal = 0.0
+                    paper_total = realized
 
-            unreal = paper_unrealized_pnl(pos, px)
-            if abs(float(unreal) - float(cache.get("unrealized_pnl", 0.0))) >= 0.01:
-                cache["unrealized_pnl"] = float(unreal)
-                cache["version"] = int(cache.get("version", 0)) + 1
-                st.session_state["trade_easy_paper_display_version"] = cache["version"]
-                _render_paper_cells(force=True)
+        # Update paper unrealized P&L in session state without creating any
+        # duplicate Streamlit elements. The next render will use this value.
+        if pos and px is not None:
+            unreal_new = float(paper_unrealized_pnl(pos, float(px)))
+            if abs(unreal_new - float(paper_cache.get("unrealized_pnl", 0.0))) >= 0.01:
+                paper_cache["unrealized_pnl"] = unreal_new
+                paper_cache["version"] = int(paper_cache.get("version", 0)) + 1
+            unreal = unreal_new
+            paper_total = realized + unreal
 
-        # VIX is intentionally silent after the cash market closes.
-        vix, vix_trend, _ = india_vix_snapshot(token, appid, min_interval=5.0)
-        if vix is not None and abs(float(vix) - float(st.session_state.get("trade_easy_vix_display", vix))) >= 0.01:
-            live_vix_box.markdown(
-                f"<div style='font-size:1.05rem;font-weight:750'>{float(vix):.2f}</div><div style='font-size:.7rem;opacity:.7'>LIVE • {vix_trend}</div>",
+        # Human-readable live state.
+        status_class = "live" if ws_status == "LIVE" else "wait"
+        status_text = "LIVE" if ws_status == "LIVE" else ws_status
+        live_price_text = f"₹{float(px):,.2f}" if px is not None else "—"
+        p_and_l_text = f"₹{paper_total:,.2f}"
+        position_text = str(pos.get("direction", "FLAT")) if pos else "FLAT"
+        entry_text = f"₹{float(pos.get('entry_price')):,.2f}" if pos else "—"
+        vix_text = f"{float(vix):.2f}" if vix is not None else "—"
+        vix_sub = f"LIVE • {vix_trend}" if vix is not None and market_live else "LAST AVAILABLE"
+        age_text = f"tick {tick_age:.1f}s" if tick_age is not None else "no tick yet"
+        health_bits = [
+            f"<span class='dot {status_class}'></span><b>FYERS DATA {status_text}</b>",
+            f"{sym}",
+            age_text,
+            f"ticks={int(live.get('tick_count', 0)) if market_live and token and appid else 0}",
+        ]
+        if quote_error and px is None:
+            health_bits.append(f"quote fallback: {str(quote_error)[:160]}")
+        if ws_error:
+            health_bits.append(f"socket: {str(ws_error)[:180]}")
+
+        with st.container():
+            st.markdown(
+                f"""
+                <div class='live-ticker-shell'>
+                  <div class='live-ticker-top'>
+                    <b>MARKET DATA</b> • {index_name} • {session_label}
+                  </div>
+                  <div class='live-ticker-grid'>
+                    <div class='live-cell price'><span>LIVE PRICE</span><strong>{live_price_text}</strong><small>{'WebSocket' if ws_status == 'LIVE' else 'REST / cached'}</small></div>
+                    <div class='live-cell'><span>PAPER P&L</span><strong>{p_and_l_text}</strong><small>realized + unrealized</small></div>
+                    <div class='live-cell'><span>POSITION</span><strong>{position_text}</strong><small>{'OPEN' if pos else 'FLAT'}</small></div>
+                    <div class='live-cell'><span>ENTRY</span><strong>{entry_text}</strong><small>paper setup</small></div>
+                    <div class='live-cell'><span>MARKET</span><strong>{'LIVE' if market_live else session_label}</strong><small>{sym}</small></div>
+                    <div class='live-cell vix'><span>INDIA VIX</span><strong>{vix_text}</strong><small>{vix_sub}</small></div>
+                  </div>
+                  <div class='live-event'>{' • '.join(health_bits)}</div>
+                </div>
+                """,
                 unsafe_allow_html=True,
             )
-            st.session_state["trade_easy_vix_display"] = float(vix)
+
+        # Keep the latest health state available to the strategy fragment.
+        st.session_state["trade_easy_live_price_cached"] = (
+            float(px) if px is not None else st.session_state.get("trade_easy_live_price_cached")
+        )
+        st.session_state["trade_easy_ws_status"] = ws_status
+        st.session_state["trade_easy_ticker_quote_error"] = quote_error
+        st.session_state["trade_easy_data_health_ticker"] = {
+            "status": ws_status,
+            "symbol": sym,
+            "price": px,
+            "tick_age": tick_age,
+            "tick_count": int(live.get("tick_count", 0)) if market_live and token and appid else 0,
+            "ws_error": ws_error,
+            "quote_error": quote_error,
+        }
 
     if hasattr(st, "fragment"):
-        _live_fragment = st.fragment(run_every=0.25, key="trade_easy_live_ticker")(_render_live_ticker)
+        _live_fragment = st.fragment(run_every="1s", key="trade_easy_live_ticker")(_render_live_ticker)
         _live_fragment()
     else:
         _render_live_ticker()
 
-    # Option Chain: live numbers update only while the cash market is LIVE.
-    # After market close the last snapshot remains completely static.
-    option_chain_root = st.empty()
-    with option_chain_root.container():
-        st.markdown('<div class="section-head">📊 Option Chain</div>', unsafe_allow_html=True)
-        _oc_shell = st.columns(6)
-        for _col, _label in zip(_oc_shell, ["ATM / Spot", "PCR", "Max Pain", "CALL OI", "PUT OI", "OI Change"]):
-            _col.metric(_label, "—")
-        st.caption("WAITING FOR LIVE OPTION-CHAIN DATA")
-
+    # Option Chain: keep the complete render tree inside its own fragment.
+    # This avoids updating an external st.empty() placeholder from a fragment,
+    # which can produce DuplicateElement errors on Streamlit Cloud.
     def _option_chain_fingerprint(df, live_px):
         if df is None or df.empty:
             return "EMPTY"
@@ -4453,37 +4480,37 @@ def dashboard(user, workspace):
             raw = repr(temp.to_dict("records")).encode()
         return hashlib.sha256(raw).hexdigest()
 
-    @st.fragment(run_every="1.5s", key="trade_easy_option_chain")
+    @st.fragment(run_every="2s", key="trade_easy_option_chain")
     def _render_live_option_chain():
         market_live, session_label = india_market_status()
         token = st.session_state.get("fyers_access_token")
         appid = st.session_state.get("fyers_app_id", "").strip()
+
+        st.markdown('<div class="section-head">📊 Option Chain</div>', unsafe_allow_html=True)
+
         if not token or not appid:
+            cols = st.columns(6)
+            for col, label in zip(cols, ["ATM / Spot", "PCR", "Max Pain", "CALL OI", "PUT OI", "OI Change"]):
+                col.metric(label, "—")
+            st.caption("Waiting for FYERS data connection.")
             return
 
         if not market_live:
-            # One snapshot at most after a fresh app session; then remain quiet.
-            if st.session_state.get("trade_easy_closed_chain_initialized"):
-                return
-            cached_df = st.session_state.get("trade_easy_option_chain_cache_by_symbol", {}).get(symbol)
+            cached_df = (st.session_state.get("trade_easy_option_chain_cache_by_symbol", {}) or {}).get(symbol)
             chain_df, chain_err = cached_df, None
             if chain_df is None or chain_df.empty:
                 try:
                     chain_df, chain_err = option_chain_snapshot(token, appid, symbol, min_interval=5.0)
                 except Exception as exc:
                     chain_err = str(exc)
+            chain_live_price = st.session_state.get("trade_easy_live_price_cached")
             if chain_df is not None and not chain_df.empty:
-                chain_live_price = st.session_state.get("trade_easy_live_price_cached")
-                with option_chain_root:
-                    render_professional_option_chain(chain_df, chain_live_price, index_name, strike_count=10)
-                    st.caption("⚪ Market closed • option-chain snapshot is static")
-            elif chain_err:
-                with option_chain_root:
-                    st.caption(f"Option Chain unavailable: {chain_err}")
-            st.session_state["trade_easy_closed_chain_initialized"] = True
+                render_professional_option_chain(chain_df, chain_live_price, index_name, strike_count=10)
+                st.caption("⚪ Market closed • option-chain snapshot is static")
+            else:
+                st.caption(f"Option Chain unavailable: {chain_err or 'no cached data'}")
             return
 
-        st.session_state["trade_easy_closed_chain_initialized"] = False
         live_now = fyers_live_feed(token, appid, symbol)
         chain_live_price = parse_live_price(live_now.get("latest")) or live_now.get("last_tick_price")
         if chain_live_price is None:
@@ -4493,18 +4520,20 @@ def dashboard(user, workspace):
         option_ticks = fyers_option_live_feed(token, appid, chain_df)
         chain_df = merge_option_ticks(chain_df, option_ticks)
         if chain_df is None or chain_df.empty:
+            st.caption(f"Option Chain data unavailable: {chain_err or 'no CE/PE rows returned'}")
+            if live_now.get("error"):
+                st.warning(f"Market data socket: {live_now.get('error')}")
             return
 
+        # Always render the latest good chain. The snapshot layer itself is
+        # throttled, so this fragment does not hammer the option-chain endpoint.
         fp = _option_chain_fingerprint(chain_df, chain_live_price)
-        if fp == st.session_state.get("trade_easy_option_display_fingerprint"):
-            return
         st.session_state["trade_easy_option_display_fingerprint"] = fp
-
-        with option_chain_root:
-            render_professional_option_chain(chain_df, chain_live_price, index_name, strike_count=10)
-            st.caption("🟢 Option Chain LIVE • values redraw only when displayed numbers change")
-            if chain_err:
-                st.caption(f"Last refresh warning: {chain_err} • showing last good data")
+        render_professional_option_chain(chain_df, chain_live_price, index_name, strike_count=10)
+        status = live_now.get("status") or ("LIVE" if live_now.get("connected") else "RECONNECTING")
+        st.caption(f"🟢 Option Chain • {status} • snapshot refresh throttled • {symbol}")
+        if chain_err:
+            st.caption(f"Last refresh warning: {chain_err} • showing latest available data")
 
     _render_live_option_chain()
 
@@ -4646,6 +4675,21 @@ def dashboard(user, workspace):
         status_text = "CONFIRMED" if strategy_confirmed else "LAST SNAPSHOT / WAITING"
 
         with strategy_root.container():
+            health = snap.get("data_health", {}) or {}
+            st.markdown('<div class="section-head">📡 Market Data Health</div>', unsafe_allow_html=True)
+            h1, h2, h3, h4, h5 = st.columns(5)
+            h1.metric("WebSocket", health.get("status", "WAITING"))
+            h2.metric("Live LTP", f"₹{float(health['live_price']):,.2f}" if health.get("live_price") is not None else "—")
+            h3.metric("Tick Age", f"{float(health['tick_age']):.1f}s" if health.get("tick_age") is not None else "—")
+            h4.metric("Ticks", int(health.get("tick_count", 0)))
+            h5.metric("History", "READY" if not health.get("history_warning") else "ERROR")
+            if health.get("ws_error"):
+                st.warning(f"WebSocket: {health.get('ws_error')}")
+            if health.get("quote_error") and health.get("live_price") is None:
+                st.error(f"Quotes fallback: {health.get('quote_error')}")
+            if health.get("history_warning"):
+                st.warning(f"History: {health.get('history_warning')}")
+
             st.markdown('<div class="section-head">Trade Easy Strategy Dashboard</div>', unsafe_allow_html=True)
             st.caption(
                 f"Dashboard Cards / Panels हमेशा दिखाई देंगे • {last_label} • "
@@ -4779,7 +4823,7 @@ def dashboard(user, workspace):
         # Completed-candle history changes only when the selected timeframe closes.
         # During market close, a single cached snapshot is enough.
         try:
-            history_interval = 8.0 if strategy_market_live else 9999999.0
+            history_interval = HISTORY_REFRESH_INTERVAL_SECONDS if strategy_market_live else 9999999.0
             raw, history_warning = fyers_history_snapshot(
                 access_token, active_app_id, symbol, resolution=timeframe,
                 days=5, min_interval=history_interval,
@@ -4788,6 +4832,7 @@ def dashboard(user, workspace):
                 st.session_state["trade_easy_strategy_history_warning"] = history_warning
         except Exception as exc:
             st.session_state["trade_easy_strategy_error"] = str(exc)
+            st.session_state["trade_easy_strategy_history_warning"] = str(exc)
             return
     
         # The strategy engine uses the live tick only while the market is open.
@@ -4799,9 +4844,9 @@ def dashboard(user, workspace):
             tick_age = (time.time() - float(tick_received)) if tick_received else None
             quote_price = None
             quote_error = None
-            if ws_price is None or tick_age is None or tick_age > 1.0:
+            if ws_price is None or tick_age is None or tick_age > LIVE_TICK_MAX_AGE_SECONDS:
                 last_quote_at = float(st.session_state.get("trade_easy_last_quote_at", 0.0))
-                if time.time() - last_quote_at >= 1.0:
+                if time.time() - last_quote_at >= QUOTE_FALLBACK_INTERVAL_SECONDS:
                     quote_price, quote_error = fyers_fetch_quote(access_token, active_app_id, symbol)
                     st.session_state["trade_easy_last_quote_at"] = time.time()
                     if quote_price is not None:
@@ -4879,8 +4924,18 @@ def dashboard(user, workspace):
 
         # Sidebar remains static. Updating an outside sidebar from a fragment
         # causes layout-context errors and adds unnecessary repainting.
-        ws_status = "CONNECTED" if live_state.get("connected") else "RECONNECTING"
+        ws_status = str(live_state.get("status") or ("CONNECTED" if live_state.get("connected") else "RECONNECTING"))
         st.session_state["trade_easy_ws_status"] = ws_status
+        st.session_state["trade_easy_data_health"] = {
+            "status": ws_status,
+            "symbol": symbol,
+            "live_price": live_price,
+            "tick_age": tick_age,
+            "tick_count": int(live_state.get("tick_count", 0)),
+            "ws_error": live_state.get("error"),
+            "quote_error": quote_error,
+            "history_warning": st.session_state.get("trade_easy_strategy_history_warning"),
+        }
     
         # FYERS history may include the currently forming candle.
         # The PDF safety rule evaluates completed candles only.
@@ -5161,6 +5216,7 @@ def dashboard(user, workspace):
             "session_failures": list(session_status.get("failures", [])),
             "session_label": "LIVE" if strategy_market_live and not session_status.get("failures") else ("MARKET CLOSED" if not strategy_market_live else "BLOCKED"),
             "live_price": float(live_price) if live_price is not None else None,
+            "data_health": dict(st.session_state.get("trade_easy_data_health") or {}),
             "completed_candle": latest_completed_ts,
             "evaluated_at": evaluated_at,
             "paper": {
